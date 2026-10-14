@@ -17,7 +17,8 @@ from . import crypto
 from .backup import BackupError, create_backup, restore_backup, verify_backup
 from .config import Settings, load_settings
 from .db import SchemaError, Store
-from .migrate import MigrationError, migrate_v1_to_v2, migrate_v2_to_v3
+from .db import SCHEMA_VERSION
+from .migrate import MigrationError, migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4
 
 
 @dataclass
@@ -208,37 +209,36 @@ def cmd_migrate(_args: argparse.Namespace, ctx: Context) -> int:
     if not store.exists():
         raise CliError("No vault database found. Run: pastry setup")
     version = store.schema_version()
-    if version == 3:
-        print("The vault is already on schema v3. Nothing to do.")
+    if version == SCHEMA_VERSION:
+        print(f"The vault is already on schema v{SCHEMA_VERSION}. Nothing to do.")
         return 0
-    if version not in (1, 2):
+    if version not in (1, 2, 3):
         raise CliError(f"Unknown schema version {version}; refusing to migrate.")
-    if version == 2:
-        # v2 -> v3 is additive (package tables) and needs no password.
-        try:
-            backup = create_backup(settings, settings.backup_dir)
-            print(f"Pre-migration backup written: {backup}")
-            migrate_v2_to_v3(store)
-        except (MigrationError, BackupError) as exc:
-            raise CliError(f"Migration failed and was rolled back; the database is unchanged. ({exc})") from exc
-        print("Migrated the vault to schema v3 (server-enforced package tables added).")
-        return 0
-    print("Migrating schema v1 -> v2 -> v3. Stop the server first (systemctl stop pastry).")
-    password = ctx.prompt_password("Master password: ")
-    auth = authmod.read_auth(settings.auth_path)
-    dek = authmod.try_unlock(auth, password)
-    if dek is None:
-        raise CliError("Incorrect master password. Nothing was changed.")
+    # Every step that rewrites data is preceded by a verified backup.
+    print(f"Migrating schema v{version} -> v{SCHEMA_VERSION}. Stop the server first (systemctl stop pastry).")
+    dek = None
+    if version == 1:
+        password = ctx.prompt_password("Master password: ")
+        auth = authmod.read_auth(settings.auth_path)
+        dek = authmod.try_unlock(auth, password)
+        if dek is None:
+            raise CliError("Incorrect master password. Nothing was changed.")
     try:
         backup = create_backup(settings, settings.backup_dir)
         print(f"Pre-migration backup written: {backup}")
-        count = migrate_v1_to_v2(store, dek)
-        migrate_v2_to_v3(store)
+        verify_backup(settings, backup)
+        if version == 1:
+            count = migrate_v1_to_v2(store, dek)
+            print(f"Migrated {count} entries to schema v2.")
+        if version in (1, 2):
+            migrate_v2_to_v3(store)
+        info = migrate_v3_to_v4(store)
     except (MigrationError, BackupError) as exc:
         raise CliError(f"Migration failed and was rolled back; the database is unchanged. ({exc})") from exc
     finally:
         crypto.wipe(dek)
-    print(f"Migrated {count} entries to schema v3. Separate-password locks were preserved.")
+    print(f"Migrated to schema v{SCHEMA_VERSION}: {info['entries']} entries and {info['packages']} package records "
+          "kept. Separate-password locks were preserved.")
     return 0
 
 

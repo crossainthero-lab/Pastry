@@ -17,7 +17,7 @@ import json
 from typing import Callable
 
 from . import crypto
-from .db import PACKAGE_STATEMENTS, SCHEMA_VERSION, Store
+from .db import ACCOUNT_STATEMENTS, PACKAGE_STATEMENTS, SCHEMA_VERSION, Store
 from .vault import META_AAD_PREFIX
 
 V1_META_PREFIX = b"pastry:meta:"
@@ -117,5 +117,45 @@ def migrate_v2_to_v3(store: Store) -> None:
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("3",)  # this step produces v3 exactly,
+        )
+
+
+def migrate_v3_to_v4(store: Store) -> dict:
+    """Additive, no password needed. Adds per-account ownership without touching any blob.
+
+    - entries.owner_id (default 0: every existing entry belongs to the owner)
+    - users and invitations tables
+    - packages.owner becomes the owner's account id "0" (it was the owner's username)
+
+    One transaction. Verified before commit: counts unchanged, every package owned by "0",
+    SQLite integrity check passes. Any failure rolls everything back.
+    """
+    if store.schema_version() != 3:
+        raise MigrationError("The database is not schema v3; nothing to migrate.")
+    with store.transaction() as conn:
+        entries_before = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        packages_before = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+        conn.execute("ALTER TABLE entries ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 0")
+        for statement in ACCOUNT_STATEMENTS:
+            conn.execute(statement)
+        conn.execute("UPDATE packages SET owner = '0'")
+        entries_after = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        packages_after = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+        if entries_after != entries_before or packages_after != packages_before:
+            raise MigrationError("verification failed: row counts changed")
+        wrong = conn.execute("SELECT COUNT(*) FROM packages WHERE owner != '0'").fetchone()[0]
+        if wrong:
+            raise MigrationError("verification failed: package ownership")
+        non_owner = conn.execute("SELECT COUNT(*) FROM entries WHERE owner_id != 0").fetchone()[0]
+        if non_owner:
+            raise MigrationError("verification failed: entry ownership")
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise MigrationError("verification failed: integrity check")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(SCHEMA_VERSION),),
         )
+    return {"entries": entries_after, "packages": packages_after}

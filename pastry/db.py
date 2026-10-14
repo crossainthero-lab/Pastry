@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 PACKAGE_STATEMENTS = (
     """
@@ -42,6 +42,36 @@ CREATE TABLE IF NOT EXISTS release_nonces (
 )
 """,
 )
+# Accounts other than the owner (schema v4). The owner's account stays in config/auth.json.
+# Each account has its own Argon2id salt, password verifier and random vault key, wrapped by its KEK.
+ACCOUNT_STATEMENTS = (
+    """
+CREATE TABLE IF NOT EXISTS users (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,   -- account id; the owner is 0 and never appears here
+    username     TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    role         TEXT NOT NULL CHECK (role IN ('user')),
+    password_hash TEXT NOT NULL,                      -- Argon2id verifier (login)
+    kek_salt     BLOB NOT NULL,
+    kdf          TEXT NOT NULL,                       -- Argon2id parameters, JSON
+    wrapped_dek  BLOB NOT NULL,                       -- account vault key, AES-256-GCM under the KEK
+    session_epoch INTEGER NOT NULL DEFAULT 0,
+    disabled     INTEGER NOT NULL DEFAULT 0 CHECK (disabled IN (0, 1)),
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS invitations (
+    token_hash   TEXT PRIMARY KEY,                    -- SHA-256 of the invitation token
+    username     TEXT NOT NULL,
+    role         TEXT NOT NULL CHECK (role IN ('user')),
+    created_by   TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    expires_at   REAL NOT NULL,
+    used_at      REAL
+)
+""",
+)
 # Server-enforced packages (schema v3). Release material is sealed under release_kek,
 # which lives in config/release.key and is excluded from backups (docs/CRYPTOGRAPHY-V12.md, 10.2).
 PACKAGE_SCHEMA = ";\n".join(PACKAGE_STATEMENTS) + ";"
@@ -54,6 +84,7 @@ CREATE TABLE IF NOT EXISTS meta (
 CREATE TABLE IF NOT EXISTS entries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     uid          TEXT NOT NULL UNIQUE,      -- random, used as AAD
+    owner_id     INTEGER NOT NULL DEFAULT 0,  -- account that owns the entry (0 = the owner)
     meta_blob    BLOB NOT NULL,             -- vault key: name, url, category, favourite, timestamps, lock info
     content_blob BLOB NOT NULL              -- vault key or entry key: username, password, notes, fields
 );
@@ -63,7 +94,7 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     blocked_until REAL NOT NULL DEFAULT 0
 );
 """
-SCHEMA = _BASE_SCHEMA + PACKAGE_SCHEMA
+SCHEMA = _BASE_SCHEMA + PACKAGE_SCHEMA + ";\n".join(ACCOUNT_STATEMENTS) + ";"
 
 
 class SchemaError(Exception):
