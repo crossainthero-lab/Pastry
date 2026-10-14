@@ -227,3 +227,18 @@ If the unit is already installed from v1.0, rerun `./install.sh --systemd`, whic
 | `allowed_origins` | `[]` | Usually empty |
 
 Unknown keys are rejected at startup.
+
+---
+
+## H. Recipient viewer (no server)
+
+Recipients need only the viewer. They do not need the server source, the sender's repository, or any server configuration.
+
+```bash
+pip wheel . --no-deps -w dist/          # run by the sender, from the repository
+pipx install dist/pastry_password_server-1.1.0-py3-none-any.whl
+```
+
+Upgrade with `pipx upgrade pastry-password-server` after installing a newer wheel. Uninstall with `pipx uninstall pastry-password-server`. Clipboard support needs `xclip`, `xsel` or `wl-clipboard` on Linux.
+
+**Time-limited sharing through the Tailscale release service is not implemented in this version.** The Tailscale access note for a release service applies only once that service exists. Until then, use offline packages and share the password through a different channel.

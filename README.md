@@ -43,7 +43,7 @@ Pastry/
 │   └── static/                app.css, app.js
 ├── SECURITY-REVIEW.md         threat model, crypto design, audit findings (v1.1)
 └── DEPLOYMENT.md              install, upgrade from v1.0, Tailscale, Caddy, systemd
-└── tests/                     pytest suite (126 tests), frozen v1 fixture in fixtures/v1
+└── tests/                     pytest suite (192 tests), frozen v1 fixture in fixtures/v1
 ```
 
 ---
@@ -400,7 +400,7 @@ Run the suite:
 .venv/bin/python -m pytest -q
 ```
 
-**Result: 126 passed.** The original 72 tests still pass, and v1.1 adds 54 more (migration, throttling, sessions, password change, re-lock, backup v2). Coverage by requirement:
+**Result: 192 passed.** (126 from v1.1, plus 66 for packages, the viewer, export and terminal tests.) The original 72 tests still pass, and v1.1 adds 54 more (migration, throttling, sessions, password change, re-lock, backup v2). Coverage by requirement:
 
 | Requirement | Tests |
 |---|---|
@@ -458,3 +458,36 @@ Please read these before relying on Pastry for anything important.
 ## Licence and use
 
 Personal project. Use it at your own risk, and keep a tested backup before you move any real credentials into it.
+
+---
+
+## 12. Secure packages (`.pastry`), v1.2 branch
+
+Export selected entries as an encrypted file, then open it in a terminal.
+
+**Export.** Tick entries in the list, then press *Export as Pastry*. Choose a package name, a package password (12 or more characters; use *Generate*), whether the viewer may copy values, and an advisory expiry. Protected entries must be unlocked first. The file is downloaded directly and is never stored on the server.
+
+**Open (recipient).** Put the `.pastry` file in a folder and run:
+
+```bash
+pastry              # picker: lists .pastry files in the current folder only
+pastry open server-access.pastry
+pastry inspect server-access.pastry     # metadata only, no decryption
+```
+
+Keys in the viewer: Up/Down move, Enter opens, R reveals or hides secrets, C copies (only if the sender allowed it), Tab moves to the next field, Esc goes back, Q quits.
+
+**Limits you must understand.** Expiry is advisory and is enforced only by this viewer. Copying can be disabled in the viewer but cannot be prevented in general. Anyone with the file and its password can read it at any time. Timed and one-time packages that need a release server are **not implemented**. See `docs/CRYPTOGRAPHY-V12.md` and `SECURITY-REVIEW.md` section 11.
+
+**Recipient installation** (base dependencies only, no server):
+
+```bash
+pipx install ./pastry_password_server-1.1.0-py3-none-any.whl
+pastry --version
+pipx upgrade pastry-password-server          # after installing a newer wheel
+pipx uninstall pastry-password-server
+```
+
+Build the wheel from the repository with `pip wheel . --no-deps -w dist/`. Copy-to-clipboard needs one of `xclip`, `xsel`, `wl-clipboard` (Linux) or `pbcopy` (macOS).
+
+**Multi-user accounts and entry sharing are not in this branch.** `pastry admin create-user` refuses, and there is no sharing feature.

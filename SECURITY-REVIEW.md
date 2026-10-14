@@ -143,7 +143,7 @@ Consequences that follow from single-user operation:
 
 ## 9. Tests
 
-The suite has 126 tests. The 72 v1 tests still pass. The new modules are:
+The suite has 192 tests. The 126 from v1.1 still pass. The new modules are:
 
 - `test_migration.py`: migration of the frozen v1 fixture, preserved separate-password locks, rollback after an injected failure, backup before migration, wrong-password refusal, server and `start` refusing an unmigrated vault.
 - `test_v11_security.py`: persistent throttling across restart, spoofed forwarded headers, session listing and revocation, password change through the API, idle re-lock, encrypted timestamps, nonce uniqueness, ciphertext swapping between entries, XSS data handling, anonymous access to every route, atomic auth-file replacement.
@@ -164,3 +164,49 @@ Run with `.venv/bin/python -m pytest -q`. The result at the time of writing is i
 4. The Tailscale and Caddy deployment paths were documented but not exercised here, because no tailnet or LAN was available.
 5. Python cannot guarantee key erasure.
 6. No independent review has been done. Security-sensitive code, especially the migration and backup paths, should be reviewed before depending on it.
+
+---
+
+## 11. v1.2 branch: what was added, and what is still missing
+
+Branch: `feature/v1.2-secure-sharing`. Version in code is still 1.1.0, because most of the v1.2 scope is not implemented. The version will move to 1.2.0 only when multi-user, sharing and server-enforced packages are done.
+
+### Implemented on the branch
+
+- **Offline `.pastry` packages** (format version 1, documented in `docs/CRYPTOGRAPHY-V12.md`). Random per-package DEK, Argon2id-derived KEK from the package password, AES-256-GCM envelope, authenticated plaintext header, bounded sizes and KDF parameters. Keys are independent of the vault.
+- **Export as Pastry** (web UI and `POST /api/packages/export`). Exports only the selected entries. Protected entries require their separate password first, enforced on the server. Timed and one-time modes return HTTP 501. No plaintext export is written to disk.
+- **Terminal viewer** (`pastry`, `pastry open`, `pastry inspect`). Standard-library curses, masked password entry, masked secrets revealed with R, optional copy with clipboard clearing only when the value is unchanged, expiry check every half second, optional deletion of the exact opened file on expiry.
+- **Recipient install without the server stack.** Base dependencies are `argon2-cffi` and `cryptography`. FastAPI and uvicorn are in the `server` extra. Verified in a clean venv: `pastry inspect` and `pastry open` work, and `pastry start` fails with a clear message.
+
+### Not implemented (disabled or refused, not faked)
+
+- **Multi-user accounts and per-user key hierarchy.** `admin create-user` and `disable-user` refuse. No second account can exist.
+- **Entry sharing (X25519 envelope wrapping, view and edit permissions, revocation).** No sharing routes or UI exist.
+- **Server-enforced expiring packages (Mode B).** No release secret, no key-release protocol, no redemption counter, no server-side revocation. Timed and one-time packages are refused.
+- **Packages management UI** (listing, revoke, delete). Packages are not recorded server-side, so there is nothing to revoke.
+- **Users page, Shared With Me page, Manage Access page.** Not built.
+- **Separate standalone recipient distribution.** The recipient wheel is the same project wheel with the server code inside but inert unless the server extra is installed. A truly separate distribution was not built.
+
+### New risks introduced by v1.2
+
+| Risk | Detail | Mitigation |
+|---|---|---|
+| Offline guessing of package passwords | Anyone with the file can attempt passwords offline. Each guess costs one Argon2id derivation (64 MiB). | Passwords under 12 characters are refused. The generator produces 16 to 48 characters. Nothing else can limit offline guessing. |
+| Advisory expiry is bypassable | A modified viewer or a copy of the file ignores `expires_at`. | Stated in the UI and docs. Not a security control. |
+| Copy setting is not DRM | Terminal selection, screenshots and transcription still work. | Stated in the UI and docs. |
+| Clipboard contents | Copied values stay on the clipboard until cleared. The clear is best effort and runs only while the viewer process is alive. | Clear after 30 seconds by default, only if unchanged. |
+| Terminal scrollback | Revealed values may stay in terminal history. The viewer draws with curses, which does not write to scrollback, but the terminal emulator may keep its own history. | Documented. |
+| Package names are plaintext | The label is in the authenticated header. | Documented. Use neutral labels. |
+| File-size and cost limits | Hostile files cannot force large memory use because KDF parameters are bounded, and file size, header size, entry count and field sizes are capped. | Tested. |
+| Python memory retention | Keys and decrypted values are best-effort wiped. | Documented. |
+
+### Verification performed
+
+- Pytest: 192 passed (126 pre-existing, plus 66 for packages, viewer, export API and pseudo-terminal tests).
+- Pseudo-terminal tests drive the real viewer with pexpect: picker, masked password, wrong password, copy disabled, empty directory, `open`, `inspect`.
+- Browser test (headless Chrome): select two entries, export with copy disabled, download the file, and decrypt it with the package password. The result contains exactly the two entries.
+- Earlier browser passes re-run against the new UI, with no regressions.
+
+### Items that still need independent review before any trust
+
+The package envelope, the header binding and the bounds checks are small, but they are new cryptographic code written here. They need a review by someone who does cryptographic engineering before anyone relies on them for real secrets.
