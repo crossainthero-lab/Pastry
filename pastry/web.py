@@ -9,7 +9,7 @@ import math
 import sqlite3
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlsplit
@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import auth as authmod
-from . import crypto
+from . import crypto, package
 from .auth import AuthFile
 from .config import Settings
 from .db import SCHEMA_VERSION, Store
@@ -165,6 +165,15 @@ def _content_of(body: EntryIn) -> dict:
 class PasswordChangeIn(BaseModel):
     current: str = Field(min_length=1, max_length=authmod.MAX_PASSWORD_LEN)
     new: str = Field(min_length=authmod.MIN_PASSWORD_LEN, max_length=authmod.MAX_PASSWORD_LEN)
+
+
+class PackageExportIn(BaseModel):
+    entry_ids: list[int] = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=12, max_length=256)
+    allow_copy: bool = True
+    access: str = Field(default="offline", max_length=20)
+    expires_in_minutes: int | None = Field(default=None, ge=1, le=43200)
 
 
 # ----- shared application state -------------------------------------------
@@ -595,5 +604,34 @@ def create_app(
         except ValueError as exc:
             raise VaultError("invalid", "The selected file is not valid JSON.") from exc
         return ctx.vault(session).import_(document, body.passphrase)
+
+
+    @app.post("/api/packages/export")
+    def export_package(body: PackageExportIn, session: Session = Depends(require_write)):
+        """Build an offline `.pastry` package in memory and return it as a download.
+        Nothing is written to disk and nothing is stored on the server."""
+        if body.access != "offline":
+            raise HTTPException(501, "Timed and one-time packages need the Pastry release service, "
+                                     "which is not implemented in this version. Use an offline package.")
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(minutes=body.expires_in_minutes) if body.expires_in_minutes else None
+        vault = ctx.vault(session)
+        entries = []
+        for entry_id in dict.fromkeys(body.entry_ids):  # de-duplicate, keep order
+            item = vault.get(entry_id, entry_keys(session, entry_id, touch=True))
+            if item.get("locked") and "username" not in item:
+                raise VaultError("locked", f"Unlock \"{item['name']}\" before exporting it.")
+            entries.append({
+                "name": item["name"], "url": item["url"], "username": item["username"],
+                "password": item["password"], "notes": item["notes"], "fields": item["fields"],
+            })
+        try:
+            data = package.build_package(entries, body.password, body.name, allow_copy=body.allow_copy,
+                                         expires_at=expires_at, kdf=settings.kdf, now=now)
+        except package.PackageError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        filename = package.safe_filename(body.name)
+        return Response(content=data, media_type="application/octet-stream",
+                        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     return app
