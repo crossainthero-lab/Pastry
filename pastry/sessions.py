@@ -154,6 +154,14 @@ class SessionStore:
             ]
         return sorted(items, key=lambda item: item["created"])
 
+    def drop_entry_key(self, account_id: int, entry_id: int) -> None:
+        """Forget a separate-password key one account holds for an entry (used when its access ends)."""
+        with self._lock:
+            sessions = [x for x in self._sessions.values() if x.account_id == account_id]
+        for session in sessions:
+            with session.lock:
+                session.drop_key(entry_id)
+
     def destroy_account(self, account_id: int) -> int:
         """Drop every session of one account (used when that account is disabled)."""
         with self._lock:

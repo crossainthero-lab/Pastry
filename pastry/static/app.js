@@ -1002,8 +1002,11 @@
         });
         if (!ok) return;
         try {
-          await api.del(`/api/entries/${entry.id}/shares/${a.recipient_id}`);
+          const result = await api.del(`/api/entries/${entry.id}/shares/${a.recipient_id}`);
           toast("Access revoked");
+          if (result && result.protected_layer_unchanged) {
+            await dialog({ title: "Access revoked", message: result.message, confirmLabel: "OK" });
+          }
           await render();
         } catch (err) {
           toast(err.message);
@@ -1019,8 +1022,11 @@
         });
         if (!ok) return;
         try {
-          await api.del(`/api/entries/${entry.id}/shares`);
+          const result = await api.del(`/api/entries/${entry.id}/shares`);
           toast("All access revoked");
+          if (result && result.protected_layer_unchanged) {
+            await dialog({ title: "Access revoked", message: result.message, confirmLabel: "OK" });
+          }
           await render();
         } catch (err) {
           toast(err.message);

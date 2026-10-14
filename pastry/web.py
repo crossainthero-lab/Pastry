@@ -271,8 +271,13 @@ class AppContext:
         self.login_limiter = SqlRateLimiter(
             self.store, settings.login_max_failures, 900, settings.login_lockout_minutes * 60, wall_clock,
         )
+        # Per account and entry, so one account cannot lock another out of an entry; plus a ceiling per
+        # entry across all accounts, so many accounts cannot multiply the guesses.
         self.entry_limiter = SqlRateLimiter(
             self.store, settings.entry_max_failures, 600, settings.entry_lockout_minutes * 60, wall_clock,
+        )
+        self.entry_ceiling_limiter = SqlRateLimiter(
+            self.store, settings.entry_max_failures * 3, 600, settings.entry_lockout_minutes * 60, wall_clock,
         )
         # Release API limits: failed proofs per capability, and request volume per client address.
         self.release_fail_limiter = SqlRateLimiter(self.store, 5, 900, 900, wall_clock)
@@ -711,10 +716,20 @@ def create_app(
         try:
             return account_keys.load_public(ctx.store, account_id, ctx.binding_key())
         except account_keys.KeyBindingError as exc:
-            raise HTTPException(422, str(exc)) from exc
+            hint = (" If this follows a restore onto a new machine, the owner can run "
+                    "`pastry admin rebind-keys`, or revoke everyone.")
+            raise HTTPException(422, str(exc) + hint) from exc
 
     def _remaining_publics(vault: Vault, entry_id: int, excluding: list[int] | None) -> dict[int, bytes]:
         return {rid: _verified_public(rid) for rid in vault.remaining_recipients(entry_id, excluding)}
+
+    def _unlock_wait(entry_id: int, account_id: int) -> int:
+        return max(ctx.entry_limiter.blocked_for(f"entry:{entry_id}:{account_id}"),
+                   ctx.entry_ceiling_limiter.blocked_for(f"entry:{entry_id}"))
+
+    def _unlock_failed(entry_id: int, account_id: int) -> None:
+        ctx.entry_limiter.record_failure(f"entry:{entry_id}:{account_id}")
+        ctx.entry_ceiling_limiter.record_failure(f"entry:{entry_id}")
 
     @app.get("/api/directory")
     def directory(session: Session = Depends(require_session)):
@@ -741,6 +756,8 @@ def create_app(
         if recipient_id == session.account_id:
             raise HTTPException(422, "You cannot share an entry with yourself.")
         public = _verified_public(recipient_id)
+        # A key the recipient's sessions still hold from an earlier grant must not carry over.
+        ctx.sessions.drop_entry_key(recipient_id, entry_id)
         ctx.vault(session).share(entry_id, recipient_id, public, body.can_edit, body.can_export, ctx.wall_clock())
         return {"username": _account_name(recipient_id), "can_edit": body.can_edit, "can_export": body.can_export}
 
@@ -749,17 +766,31 @@ def create_app(
         ctx.vault(session).update_share(entry_id, recipient_id, body.can_edit, body.can_export, ctx.wall_clock())
         return Response(status_code=204)
 
-    @app.delete("/api/entries/{entry_id}/shares/{recipient_id}", status_code=204)
+    PROTECTED_NOTE = ("Access was revoked and the entry key was replaced. This entry also has a separate "
+                      "password, and revoking does not change it. If the person knew it, change the "
+                      "separate password now.")
+
+    def _revoked_response(was_locked: bool):
+        if was_locked:
+            return JSONResponse({"revoked": True, "protected_layer_unchanged": True, "message": PROTECTED_NOTE})
+        return Response(status_code=204)
+
+    @app.delete("/api/entries/{entry_id}/shares/{recipient_id}")
     def revoke_share(entry_id: int, recipient_id: int, session: Session = Depends(require_write)):
         vault = ctx.vault(session)
         publics = _remaining_publics(vault, entry_id, [recipient_id])
-        vault.revoke(entry_id, [recipient_id], publics, ctx.wall_clock())
-        return Response(status_code=204)
+        _, was_locked = vault.revoke(entry_id, [recipient_id], publics, ctx.wall_clock())
+        ctx.sessions.drop_entry_key(recipient_id, entry_id)
+        return _revoked_response(was_locked)
 
-    @app.delete("/api/entries/{entry_id}/shares", status_code=204)
+    @app.delete("/api/entries/{entry_id}/shares")
     def revoke_all_shares(entry_id: int, session: Session = Depends(require_write)):
-        ctx.vault(session).revoke(entry_id, None, {}, ctx.wall_clock())
-        return Response(status_code=204)
+        vault = ctx.vault(session)
+        recipients = [g["recipient_id"] for g in vault.list_access(entry_id)]
+        _, was_locked = vault.revoke(entry_id, None, {}, ctx.wall_clock())
+        for rid in recipients:
+            ctx.sessions.drop_entry_key(rid, entry_id)
+        return _revoked_response(was_locked)
 
     @app.get("/api/shared")
     def shared_with_me(session: Session = Depends(require_session)):
@@ -787,24 +818,23 @@ def create_app(
             ctx.vault(session).update_shared(entry_id, _meta_of(body), _content_of(body),
                                              entry_keys(session, entry_id, touch=True))
         except VaultError as exc:
-            if exc.code == "not_found":
+            if exc.code in ("not_found", "conflict"):
                 session.drop_key(entry_id)
             raise
         return {"ok": True}
 
     @app.post("/api/shared/{entry_id}/unlock")
     def unlock_shared(entry_id: int, body: PasswordIn, session: Session = Depends(require_write)):
-        limiter_key = f"entry:{entry_id}"
-        retry = ctx.entry_limiter.blocked_for(limiter_key)
+        retry = _unlock_wait(entry_id, session.account_id)
         if retry:
             raise HTTPException(429, f"Too many attempts. Wait {retry} seconds and try again.")
         try:
             key, _content = ctx.vault(session).unlock_shared(entry_id, body.password)
         except VaultError as exc:
             if exc.code == "bad_password":
-                ctx.entry_limiter.record_failure(limiter_key)
+                _unlock_failed(entry_id, session.account_id)
             raise
-        ctx.entry_limiter.reset(limiter_key)
+        ctx.entry_limiter.reset(f"entry:{entry_id}:{session.account_id}")
         session.put_key(entry_id, key, ctx.sessions.now())
         return _shared_detail(session, entry_id)
 
@@ -849,8 +879,13 @@ def create_app(
 
     @app.put("/api/entries/{entry_id}")
     def update_entry(entry_id: int, body: EntryIn, session: Session = Depends(require_write)):
-        ctx.vault(session).update(entry_id, _meta_of(body), _content_of(body),
-                                  entry_keys(session, entry_id, touch=True))
+        try:
+            ctx.vault(session).update(entry_id, _meta_of(body), _content_of(body),
+                                      entry_keys(session, entry_id, touch=True))
+        except VaultError as exc:
+            if exc.code == "conflict":
+                session.drop_key(entry_id)  # the separate password changed elsewhere: ask for it again
+            raise
         return {"ok": True}
 
     @app.delete("/api/entries/{entry_id}", status_code=204)
@@ -861,17 +896,16 @@ def create_app(
 
     @app.post("/api/entries/{entry_id}/unlock")
     def unlock_entry(entry_id: int, body: PasswordIn, session: Session = Depends(require_write)):
-        limiter_key = f"entry:{entry_id}"
-        retry = ctx.entry_limiter.blocked_for(limiter_key)
+        retry = _unlock_wait(entry_id, session.account_id)
         if retry:
             raise HTTPException(429, f"Too many attempts. Wait {retry} seconds and try again.")
         try:
             key, _content = ctx.vault(session).unlock(entry_id, body.password)
         except VaultError as exc:
             if exc.code == "bad_password":
-                ctx.entry_limiter.record_failure(limiter_key)
+                _unlock_failed(entry_id, session.account_id)
             raise
-        ctx.entry_limiter.reset(limiter_key)
+        ctx.entry_limiter.reset(f"entry:{entry_id}:{session.account_id}")
         session.put_key(entry_id, key, ctx.sessions.now())
         return ctx.vault(session).get(entry_id, entry_keys(session, entry_id, touch=True))
 

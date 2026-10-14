@@ -1,6 +1,6 @@
 # Multi-user accounts and sharing: cryptographic architecture (v1.2 design)
 
-Status: design for `feature/v1.2-secure-sharing`. Account separation is **implemented** in this branch as described in sections 2 to 5 and 9. Entry sharing is **not implemented and is disabled** (section 7). This document has had only a self-review. It has not been independently reviewed.
+Status: design and implementation notes for `feature/v1.2-secure-sharing`. Account separation (sections 2 to 6, 9) and entry sharing (section 7) are implemented. This document and the code have had a self-review and one separate-context AI review (see SECURITY-REVIEW.md section 14). They have not had an independent human cryptographic review.
 
 ## 0. Current architecture (what is actually built)
 
@@ -69,15 +69,69 @@ Schema v3 to v4 is additive and needs no password:
 - Each account has its own session epoch. Changing a password, or disabling the account, invalidates that account's sessions only.
 - Session IDs and CSRF tokens are per session, from `secrets`.
 
-## 7. Entry sharing: not implemented, and why
+## 7. Entry sharing (implemented)
 
-Sharing needs three things that cannot be made trustworthy in this architecture yet:
+### 7.1 Keys
 
-1. **Recipient key binding.** Sharing an entry means wrapping its key for the recipient's public key. The server distributes those public keys. A malicious or compromised server could substitute its own key and then read shared entries. Defending against this needs out-of-band verification of each recipient key, for example fingerprints compared by the two people. That verification UI does not exist.
-2. **Per-entry keys.** Today every entry is sealed under its account's DEK, so there is no entry key to hand over. Introducing per-entry keys means re-encrypting every entry, with its own migration and rollback.
-3. **Revocation with rotation.** Revoking a recipient stops future server access, but a recipient who already obtained the entry key keeps it. Rotation and re-encryption are needed to limit future copies, and they require (2).
+```
+account password ─Argon2id─▶ KEK ─wrap─▶ account vault key (DEK)
+                                              │ seals (AES-256-GCM, AAD binds account and layer)
+                                              ├─▶ account X25519 private key
+                                              └─▶ per-entry key K_e  (key_blob, AAD: entry uid + key version)
 
-Until these exist, the sharing endpoints return HTTP 501, no Share button is shown, and the "Shared With Me" page states that sharing is not available. Separate-password entries are unaffected by this decision. They stay sealed under their own key whoever the account holder is.
+K_e ─AES-256-GCM─▶ entry metadata (name, url, category, favourite, timestamps, lock state)
+K_e ─AES-256-GCM─▶ unprotected entry content
+separate password ─Argon2id─▶ K_L ─AES-256-GCM─▶ protected entry content   (K_e cannot open it)
+
+for each recipient R:
+  eph = fresh X25519 pair
+  shared = X25519(eph_private, R_public)
+  key = HKDF-SHA256(shared, salt = eph_public || R_public, info = "pastry-share/v1|" + context)
+  envelope = eph_public || nonce || AES-256-GCM(key, K_e, aad = context)
+  context = version | entry uid | owner id | recipient id | key version
+```
+
+- The envelope is bound to one entry, one owner, one recipient and one key generation. Moving it to another entry, recipient or generation fails authentication (tested).
+- Every entry has its own random key, so there is no key to hand out that opens anything else.
+- The recipient's server-side session unwraps `K_e` with their own private key (itself sealed under their vault key). Nothing about a shared entry is cached beyond the request, except a protected entry's `K_L` after the viewer entered the separate password, and that is dropped as soon as access ends.
+
+### 7.2 Public key binding
+
+Each account's public key is stored with `HMAC-SHA256(binding_key, account id || public key)`. The binding key is derived from `config/release.key` (HKDF), a secret that is not in the database or in backups. A public key whose MAC fails is never used: sharing and rotation fail closed. Someone who can only write to the database cannot redirect wrapped keys. Fingerprints (SHA-256 based, shown in the share dialog) let two people compare keys out of band.
+
+**This does not defend against a malicious or compromised server.** The server holds the binding key, performs the wrapping and decrypts unlocked data, so it can substitute keys. The design makes that one trust boundary, and does not claim otherwise.
+
+### 7.3 Permissions
+
+| Permission | Allows |
+|---|---|
+| View (always) | Read and copy the credentials. Protected entries still need their separate password. |
+| Edit | Change the name, URL and credential content. Not category, favourite, protection, sharing or deletion. |
+| Export | Package the entry as `.pastry` (offline or timed). Separate from edit. |
+
+Only the entry's owner can share, change permissions, revoke or inspect access. Every call is authorised on the server. Recipient requests re-read the share row, the key version and the permission flags inside the same transaction as the write.
+
+### 7.4 Revocation and rotation
+
+Revoking one recipient, or everyone, runs in one transaction:
+
+1. delete the share row(s);
+2. generate a new entry key `K_e'`; re-seal metadata and unprotected content under it;
+3. wrap `K_e'` under the owner's account key and re-issue each remaining recipient's envelope (each remaining public key must verify, or nothing changes);
+4. increment the key version.
+
+Server access ends on the next request. An envelope or key from the previous generation no longer opens the entry. **What revocation cannot do:** a recipient who already viewed or copied the credentials keeps what they saw, and a recipient who stored the old `K_e` can still decrypt a copy of the old ciphertext if they obtained one. The server does not hand out ciphertext after revocation. Protected content is under `K_L` and is not re-keyed by revocation; if a recipient also knows the separate password, change it (it is re-sealed under a new key).
+
+### 7.5 Migration to per-entry keys
+
+Schema v5 is additive. Existing entries stay in format 4 and keep working. At each account's next sign-in, that account's entries are converted in one transaction: a fresh `K_e` per entry, metadata and unprotected content re-sealed under it, protected content left byte-identical, IDs and owners unchanged, then every converted entry is read back before commit. Any failure rolls the whole account back, and the entries remain readable in format 4. A backup is taken and verified before the schema migration. No plaintext is written outside the process.
+
+### 7.6 Known limitations specific to sharing
+
+- A recipient must sign in once before they can receive shares (their key pair is created at sign-in).
+- Restoring a backup onto a machine with a different `config/release.key` leaves sharing failing closed until `pastry admin rebind-keys` is run after comparing fingerprints.
+- The directory endpoint shows active account names to every signed-in account. It lists no keys and no entries.
+- The owner of an entry is the only account that can protect, unprotect or delete it. Ownership cannot be transferred.
 
 ## 8. Existing secondary-password protection
 
@@ -104,6 +158,7 @@ Unchanged. A protected entry's content is sealed under a key derived from its se
 |---|---|
 | Packages keyed by username text, so renaming the owner would orphan them | Fixed by the migration to account ID. |
 | Session epoch existed only for the owner | Fixed: per-account epochs. |
-| No per-account role checks on any route | Fixed: owner-only routes check the role on the server. |
-| Sharing cannot be made safe without key verification and per-entry keys | Deferred. Disabled. |
+| No per-account role checks on any route | Fixed: owner-only routes check the role on the server, and a route inventory test enforces authentication and CSRF on every route. |
+| Sharing needed per-entry keys, recipient key binding and rotation | Implemented (section 7). |
 | Admin password reset would require a recovery path, which would weaken all vaults | Not offered. Documented as a limitation. |
+| A server that holds the binding key can substitute public keys | Accepted trust boundary of server-side decryption. Documented. Fingerprints allow out-of-band checks. |

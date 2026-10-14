@@ -211,6 +211,16 @@ class Vault:
             return conn.execute("SELECT * FROM entries WHERE owner_id = ? ORDER BY id",
                                 (self.account_id,)).fetchall()
 
+    @staticmethod
+    def _require_current_key(row: sqlite3.Row, key: bytes | bytearray) -> None:
+        """A separate-password key cached in a session may be stale (the password was changed from
+        another session). Sealing new content under it would make the entry unreadable, so it must
+        still open the stored blob first."""
+        try:
+            crypto.open_sealed(key, row["content_blob"], content_aad(row["uid"], True))
+        except CryptoError as exc:
+            raise VaultError("conflict", "This entry's separate password changed. Unlock it again.") from exc
+
     # ----- reads ---------------------------------------------------------
 
     def list(self, keys: dict[int, bytearray], query: str = "") -> list[dict]:
@@ -218,6 +228,7 @@ class Vault:
         entries whose contents are readable. Matching happens in memory only."""
         needle = query.strip().lower()
         results = []
+        counts = self._share_counts()
         for row in self._read_rows():
             meta = self._meta(row)
             key = keys.get(row["id"])
@@ -230,17 +241,20 @@ class Vault:
                 if not any(needle in str(text).lower() for text in haystack):
                     continue
             item = self._summary(row["id"], meta, key)
-            item["shared_with"] = self._share_count(row["id"])
+            item["shared_with"] = counts.get(row["id"], 0)
             results.append(item)
         results.sort(key=lambda item: item["name"].lower())
         return results
 
-    def _share_count(self, entry_id: int) -> int:
+    def _share_counts(self) -> dict[int, int]:
+        """Recipients per entry for this account, in one query."""
         try:
             with self.store.connect() as conn:
-                return int(conn.execute("SELECT COUNT(*) FROM shares WHERE entry_id = ?", (entry_id,)).fetchone()[0])
-        except sqlite3.Error:
-            return 0
+                rows = conn.execute("SELECT entry_id, COUNT(*) AS n FROM shares WHERE owner_id = ? GROUP BY entry_id",
+                                    (self.account_id,)).fetchall()
+        except sqlite3.Error:  # a database that predates schema v5 has no shares table
+            return {}
+        return {r["entry_id"]: int(r["n"]) for r in rows}
 
     def get(self, entry_id: int, keys: dict[int, bytearray]) -> dict:
         with self.store.connect() as conn:
@@ -295,6 +309,7 @@ class Vault:
                 raise VaultError("locked", "Unlock this entry before editing it.")
             full = {**current, **meta, "updated_at": _now()}
             if current["locked"]:
+                self._require_current_key(row, key)
                 content_blob = crypto.seal(key, _json(content), content_aad(row["uid"], True))
             else:
                 content_blob = self._seal_plain(row, content)
@@ -334,61 +349,61 @@ class Vault:
             row = self._fetch(conn, entry_id)
         return self._unlock_with(row, self._meta(row), password)
 
-    def _set_lock(self, entry_id: int, expect_locked: bool, new_meta_lock: dict, content_blob: bytes) -> None:
+    def enable_protection(self, entry_id: int, password: str) -> None:
+        # Everything happens in one transaction, so a concurrent edit cannot be overwritten.
         with self.store.transaction() as conn:
             row = self._fetch(conn, entry_id)
-            current = self._meta(row)
-            if bool(current["locked"]) != expect_locked:
-                raise VaultError("conflict", "The entry changed; please try again.")
-            full = {**current, **new_meta_lock, "updated_at": _now()}
-            conn.execute(
-                "UPDATE entries SET meta_blob = ?, content_blob = ? WHERE id = ? AND owner_id = ?",
-                (self._seal_meta(row, full), content_blob, entry_id, self.account_id),
-            )
-
-    def enable_protection(self, entry_id: int, password: str) -> None:
-        with self.store.connect() as conn:
-            row = self._fetch(conn, entry_id)
-        meta = self._meta(row)
-        if meta["locked"]:
-            raise VaultError("already_locked", "This entry already has a separate password.")
-        content = self._content(row, meta, None)
-        salt = crypto.new_salt()
-        key = crypto.derive_key(password, salt, self.kdf)
-        try:
-            blob = crypto.seal(key, _json(content), content_aad(row["uid"], True))
-        finally:
-            crypto.wipe(key)
-        lock = {"locked": True, "lock_salt": _b64(salt), "lock_kdf": self.kdf.to_dict()}
-        self._set_lock(entry_id, expect_locked=False, new_meta_lock=lock, content_blob=blob)
+            meta = self._meta(row)
+            if meta["locked"]:
+                raise VaultError("already_locked", "This entry already has a separate password.")
+            content = self._content(row, meta, None)
+            salt = crypto.new_salt()
+            key = crypto.derive_key(password, salt, self.kdf)
+            try:
+                blob = crypto.seal(key, _json(content), content_aad(row["uid"], True))
+            finally:
+                crypto.wipe(key)
+            lock = {"locked": True, "lock_salt": _b64(salt), "lock_kdf": self.kdf.to_dict()}
+            self._write_lock(conn, row, meta, lock, blob)
 
     def change_protection(self, entry_id: int, new_password: str, old_key: bytes | bytearray) -> bytearray:
         """Re-seal the contents under a new separate password. Returns the new key."""
-        with self.store.connect() as conn:
+        with self.store.transaction() as conn:
             row = self._fetch(conn, entry_id)
-        if not self._meta(row)["locked"]:
-            raise VaultError("not_locked", "This entry has no separate password.")
-        content = _open_json(old_key, row["content_blob"], content_aad(row["uid"], True))
-        salt = crypto.new_salt()
-        new_key = crypto.derive_key(new_password, salt, self.kdf)
-        blob = crypto.seal(new_key, _json(content), content_aad(row["uid"], True))
-        lock = {"locked": True, "lock_salt": _b64(salt), "lock_kdf": self.kdf.to_dict()}
-        try:
-            self._set_lock(entry_id, expect_locked=True, new_meta_lock=lock, content_blob=blob)
-        except VaultError:
-            crypto.wipe(new_key)
-            raise
+            meta = self._meta(row)
+            if not meta["locked"]:
+                raise VaultError("not_locked", "This entry has no separate password.")
+            self._require_current_key(row, old_key)
+            content = _open_json(old_key, row["content_blob"], content_aad(row["uid"], True))
+            salt = crypto.new_salt()
+            new_key = crypto.derive_key(new_password, salt, self.kdf)
+            blob = crypto.seal(new_key, _json(content), content_aad(row["uid"], True))
+            lock = {"locked": True, "lock_salt": _b64(salt), "lock_kdf": self.kdf.to_dict()}
+            try:
+                self._write_lock(conn, row, meta, lock, blob)
+            except BaseException:
+                crypto.wipe(new_key)
+                raise
         return new_key
 
     def remove_protection(self, entry_id: int, key: bytes | bytearray) -> None:
-        with self.store.connect() as conn:
+        with self.store.transaction() as conn:
             row = self._fetch(conn, entry_id)
-        if not self._meta(row)["locked"]:
-            raise VaultError("not_locked", "This entry has no separate password.")
-        content = _open_json(key, row["content_blob"], content_aad(row["uid"], True))
-        blob = self._seal_plain(row, content)
-        lock = {"locked": False, "lock_salt": None, "lock_kdf": None}
-        self._set_lock(entry_id, expect_locked=True, new_meta_lock=lock, content_blob=blob)
+            meta = self._meta(row)
+            if not meta["locked"]:
+                raise VaultError("not_locked", "This entry has no separate password.")
+            self._require_current_key(row, key)
+            content = _open_json(key, row["content_blob"], content_aad(row["uid"], True))
+            lock = {"locked": False, "lock_salt": None, "lock_kdf": None}
+            self._write_lock(conn, row, meta, lock, self._seal_plain(row, content))
+
+    def _write_lock(self, conn: sqlite3.Connection, row: sqlite3.Row, meta: dict, new_lock: dict,
+                    content_blob: bytes) -> None:
+        full = {**meta, **new_lock, "updated_at": _now()}
+        conn.execute(
+            "UPDATE entries SET meta_blob = ?, content_blob = ? WHERE id = ? AND owner_id = ?",
+            (self._seal_meta(row, full), content_blob, row["id"], self.account_id),
+        )
 
     # ----- upgrade of legacy entries to per-entry keys -------------------------
 
@@ -477,14 +492,17 @@ class Vault:
             if cur.rowcount == 0:
                 raise VaultError("not_found", "That account does not have access.")
 
-    def revoke(self, entry_id: int, recipient_ids: list[int] | None, publics: dict[int, bytes], now: float) -> int:
+    def revoke(self, entry_id: int, recipient_ids: list[int] | None, publics: dict[int, bytes],
+               now: float) -> tuple[int, bool]:
         """Remove access, then rotate the entry key for everyone who keeps it.
 
         `recipient_ids` None revokes everyone. `publics` maps each *remaining* recipient to their verified
         public key. The delete, re-sealing, new envelopes and key version change happen in one transaction,
-        so no request can observe a half-rotated entry. Returns how many recipients were removed."""
+        so no request can observe a half-rotated entry. Returns (recipients removed, entry is protected).
+        A protected entry's content stays under its separate-password key: revoking does not re-key it."""
         with self.store.transaction() as conn:
             row = self._ensure_v5(conn, entry_id)
+            was_locked = bool(self._meta(row)["locked"])
             if recipient_ids is None:
                 removed = conn.execute("DELETE FROM shares WHERE entry_id = ? AND owner_id = ?",
                                        (entry_id, self.account_id)).rowcount
@@ -497,7 +515,7 @@ class Vault:
                 if removed == 0:
                     raise VaultError("not_found", "That account does not have access.")
             self._rotate(conn, row, publics, now)
-        return removed
+        return removed, was_locked
 
     def _rotate(self, conn: sqlite3.Connection, row: sqlite3.Row, publics: dict[int, bytes], now: float) -> None:
         uid = row["uid"]
@@ -625,6 +643,7 @@ class Vault:
                 raise VaultError("locked", "Unlock this entry before editing it.")
             full = {**current, "name": meta_in["name"], "url": meta_in["url"], "updated_at": now_iso or _now()}
             if current["locked"]:
+                self._require_current_key(row, key)
                 content_blob = crypto.seal(key, _json(content), content_aad(row["uid"], True))
             else:
                 content_blob = crypto.seal(k_e, _json(content), content_aad_entry(row["uid"]))
