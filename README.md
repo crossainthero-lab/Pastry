@@ -43,7 +43,7 @@ Pastry/
 │   └── static/                app.css, app.js
 ├── SECURITY-REVIEW.md         threat model, crypto design, audit findings (v1.1)
 └── DEPLOYMENT.md              install, upgrade from v1.0, Tailscale, Caddy, systemd
-└── tests/                     pytest suite (192 tests), frozen v1 fixture in fixtures/v1
+└── tests/                     pytest suite (252 tests), frozen v1 fixture in fixtures/v1
 ```
 
 ---
@@ -491,3 +491,19 @@ pipx uninstall pastry-password-server
 Build the wheel from the repository with `pip wheel . --no-deps -w dist/`. Copy-to-clipboard needs one of `xclip`, `xsel`, `wl-clipboard` (Linux) or `pbcopy` (macOS).
 
 **Multi-user accounts and entry sharing are not in this branch.** `pastry admin create-user` refuses, and there is no sharing feature.
+
+---
+
+## 13. Timed packages (server-enforced), branch `feature/v1.2-secure-sharing`
+
+Set `public_url` in `config/pastry.json` (see DEPLOYMENT.md section I), then choose an access type in the export dialog:
+
+- **Expires after opening:** 5 minutes, 15 minutes, 1 hour or 24 hours, counted from the first successful release on the server.
+- **Absolute deadline:** up to 30 days from creation.
+- **One-time:** the first successful release consumes the package.
+
+Manual revocation is always available on the **Packages** page, and so is deletion. Revocation and expiry are enforced by the server clock. The file alone, with its password, cannot be opened: the server must release the key.
+
+Recipients run `pastry open FILE.pastry`. The viewer asks them to confirm the server host, then checks the server every 30 seconds and closes the secrets if the package expires, is revoked, or the server stops answering.
+
+**Important limits.** A recipient who has already opened a package may keep what they saw, and the key they were given. Revocation cannot undo that. Timed packages cannot be opened when the server is unreachable. See `SECURITY-REVIEW.md` section 12 and `docs/CRYPTOGRAPHY-V12.md` section 10. The design has had only a self-review.

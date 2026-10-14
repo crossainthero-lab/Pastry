@@ -210,3 +210,62 @@ Branch: `feature/v1.2-secure-sharing`. Version in code is still 1.1.0, because m
 ### Items that still need independent review before any trust
 
 The package envelope, the header binding and the bounds checks are small, but they are new cryptographic code written here. They need a review by someone who does cryptographic engineering before anyone relies on them for real secrets.
+
+---
+
+## 12. Server-enforced (timed) packages: implementation status and review
+
+**Review status: self-review only. Not independently reviewed. Do not treat the design or the code as reviewed.** The design is in `docs/CRYPTOGRAPHY-V12.md` section 10, which supersedes the "not implemented" statements in sections 7 and 11 above.
+
+### 12.1 What is implemented
+
+- Schema v3 adds `packages` and `release_nonces`. `pastry migrate` upgrades v2 vaults additively, without touching existing rows.
+- Export modes: **after opening** (5 minutes, 15 minutes, 1 hour, 24 hours, measured from the first successful release), **absolute deadline** (up to 30 days from creation), and **one-time** (the first successful release consumes the package). Manual revocation is available at any time. Timed modes need `public_url` in the server configuration, and they are refused without it.
+- The release protocol (status, challenge, redeem) is served under `/release/v1/` on the same app. It never reads vault entries, sessions or the vault key.
+- The recipient viewer (`pastry open`) contacts the server over HTTPS with default certificate verification. It asks for confirmation before sending anything. It polls the server every 30 seconds and fails closed after two failed checks.
+- Owner package API: create, list, download the stored encrypted copy, revoke, delete. Every query is scoped to the owner.
+- The Packages page shows name, creation time, expiry, policy, status and entry count.
+- Startup erases the release material of packages past their deadline. Listing packages does the same.
+
+### 12.2 Verification performed
+
+| Area | Tests |
+|---|---|
+| Release state machine (expiry, windows, absolute deadlines, one-time, revocation, deletion, nonce single use, nonce expiry, proof binding, cross-package nonce reuse, sweep, missing release key) | `tests/test_release.py` (24) |
+| Owner and public HTTP routes (creation validation, listing without capabilities, download, release over HTTP, rate limits, lockouts, forwarded-header independence, malformed requests, cross-owner ID manipulation, CSRF, anonymous access, expired sessions) | `tests/test_release_api.py` (21) |
+| Real sockets: full release, plain HTTP refused for remote hosts, no silent downgrade to HTTP, **self-signed certificate rejected by default**, accepted only when explicitly trusted, unreachable server reported, six concurrent network redemptions of one one-time package release exactly once | `tests/test_release_network.py` (7) |
+| Real `pastry open` in a pseudo-terminal against a live server: release and reveal, decline sends nothing, wrong password, revoked package, unreachable server with no offline fallback, expiry measured on the server clock closes the viewer, delete-on-expiry removes only the opened file | `tests/test_tui_server_pty.py` (7) |
+| Offline package format and TUI behaviour, unchanged | the 192 earlier tests |
+
+Browser check (headless Chrome, against the live scratch server): an after-opening package was created through the export dialog, listed on the Packages page, and then opened with the real `pastry open` command. The secret was masked until R was pressed. Three earlier browser passes still pass.
+
+### 12.3 What the tests do not establish
+
+- **Tailscale.** No tailnet exists on this machine, so `tailscale serve` was never run. The HTTPS path is exercised only through a self-signed local certificate and the trust-store override.
+- **Real expiry over the wire.** The expiry tests use a simulated clock shared by the server thread and the viewer. Real time was not waited on.
+- **Pexpect and threads.** The pseudo-terminal tests run while server threads exist. Python can warn that `fork` is unsafe in a multi-threaded process. This affects only the test harness.
+- **Raspberry Pi and older Ubuntu.** Not measured.
+- **Independent cryptographic review.** Not performed.
+
+### 12.4 Remaining risks (in addition to sections 7 and 11)
+
+| Risk | Detail | Mitigation |
+|---|---|---|
+| Keys already released stay usable | A recipient who has obtained `K_r` can keep the file and `K_r` and decrypt indefinitely. Expiry stops only future releases. | Stated in the UI and in `docs/CRYPTOGRAPHY-V12.md` 10.8. |
+| Key material in recipient memory | After release, `K_r` exists as Python `bytes` copies (`bytes(k_r)` for the opener), which `wipe` cannot clear. The viewer does not write it to disk. | Best effort. The release key lives in process memory long enough to decrypt the payload. |
+| Stolen database and `release.key` together | `K_auth` allows offline guessing of the package password, and then `K_r` is obtainable. | Keep `config/release.key` out of backups (done). Restrict file permissions (done). |
+| Backups and restores | `pastry backup` excludes `release.key`. A restore on a machine without that key leaves timed packages unreleasable, which is the intended safe failure. | Documented in DEPLOYMENT.md. |
+| Malicious package names a different server | The viewer shows the host and requires confirmation. A host the user confirms receives an offline-guessable proof. | The user must check the host. |
+| Sender's server sees the package password | At creation, the password reaches the server in memory to derive `K_pw` and `K_auth`. It is not stored. | Accepted, because the sender runs the server. |
+| At-most-once delivery for one-time packages | If the server commits a one-time release but the response is lost in transit, the package is consumed and the recipient gets nothing. | Documented. The alternative (release without consuming) would break the one-time guarantee. |
+| Shared rate-limit address behind Tailscale Serve | Requests arrive from the same local address, so the request-volume limit is shared among clients. The per-capability failure limit is the one that protects a package. | Documented. |
+| Offline guessing of the package password from the file | None. The file has no password-verifiable ciphertext for server packages. For offline packages (unchanged) guessing is possible at Argon2id cost. | Documented in section 10.7 of the design. |
+| Argon2id parameters | Fixed in code. | Documented. |
+| Pexpect and threads warning | Test harness only. | None needed in production. |
+
+### 12.5 Open items before any release decision
+
+1. Independent review of `docs/CRYPTOGRAPHY-V12.md` section 10 and of `pastry/release.py`, `pastry/release_client.py` and the release routes in `pastry/web.py`.
+2. A real Tailscale Serve test on the target machine, with a second device.
+3. Measurement on Raspberry Pi-class hardware.
+4. The Packages page and the release protocol still need a browser run against a Tailscale HTTPS address.

@@ -242,3 +242,35 @@ pipx install dist/pastry_password_server-1.1.0-py3-none-any.whl
 Upgrade with `pipx upgrade pastry-password-server` after installing a newer wheel. Uninstall with `pipx uninstall pastry-password-server`. Clipboard support needs `xclip`, `xsel` or `wl-clipboard` on Linux.
 
 **Time-limited sharing through the Tailscale release service is not implemented in this version.** The Tailscale access note for a release service applies only once that service exists. Until then, use offline packages and share the password through a different channel.
+
+---
+
+## I. Timed (server-enforced) packages over Tailscale
+
+Timed packages need the recipient's viewer to reach this server while the package is valid. The release protocol runs on the same port as the web interface, so the same Tailscale address serves both.
+
+**Requirements**
+
+1. Pastry runs on this machine, bound to `127.0.0.1:8787`, as in section C.
+2. `config/pastry.json` contains the HTTPS address recipients will use, and that name is in `allowed_hosts`:
+
+   ```json
+   {
+     "public_url": "https://machine-name.tailnet-name.ts.net",
+     "allowed_hosts": ["127.0.0.1", "localhost", "machine-name.tailnet-name.ts.net"]
+   }
+   ```
+
+3. Tailscale Serve publishes the port over HTTPS: `sudo tailscale serve --bg 8787`. Confirm with `tailscale serve status`. Do not enable Funnel.
+4. **Recipients need network access to the release service.** Each recipient must be on the same tailnet with a device that Tailscale's access controls allow to reach this machine on port 443. Without that access, `pastry open` reports that the server cannot be reached, and it does not fall back to offline decryption.
+5. Recipients install the viewer (section H), then run `pastry open FILE.pastry`. They confirm the host shown on screen, which must be your `public_url` host.
+
+**Operational notes**
+
+- `config/release.key` is created the first time a timed package is made. Keep it out of backups (the backup command already excludes it) and keep its permissions at 0600.
+- Restoring a backup to another machine leaves timed packages unreleasable unless `release.key` is also restored. This is deliberate.
+- To revoke everything quickly, stop the service (`sudo systemctl stop pastry`), or revoke packages individually on the Packages page.
+- Expired release material is erased at startup and whenever packages are listed.
+- Upgrading from v2 needs `.venv/bin/pastry migrate` before the new server starts. The migration is additive and makes a backup first.
+
+**Not tested here:** the Tailscale steps above were not run, because no tailnet exists on the development machine.
