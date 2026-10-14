@@ -21,6 +21,8 @@
     openEntryId: null,
     toastTimer: null,
     searchTimer: null,
+    selected: new Set(),
+    exportButton: null,
   };
 
   // ----- DOM helper -------------------------------------------------------
@@ -330,26 +332,39 @@
     } else {
       body = h("div", { class: "list" }, ...items.map(entryRow));
     }
+    state.exportButton = h("button", { class: "btn small", type: "button", text: "Export as Pastry", onclick: () => openExport([...state.selected]) });
     view.replaceChildren(
-      h("div", { class: "view-head" }, h("h1", { text: spec.title }), h("span", { class: "muted small", text: countText })),
+      h(
+        "div",
+        { class: "view-head" },
+        h("h1", { text: spec.title }),
+        h("div", { class: "export-head" }, state.exportButton, h("span", { class: "muted small", text: countText })),
+      ),
       body,
     );
+    updateExportButton();
   }
 
   function entryRow(entry) {
-    return h(
+    const box = h("input", { type: "checkbox", "aria-label": `Select ${entry.name} for export`, checked: state.selected.has(entry.id) });
+    box.addEventListener("change", () => {
+      if (box.checked) state.selected.add(entry.id);
+      else state.selected.delete(entry.id);
+      updateExportButton();
+    });
+    const link = h(
       "a",
-      { class: "entry-row", href: `#/entry/${entry.id}` },
+      { class: "entry-main", href: `#/entry/${entry.id}` },
       h(
         "div",
         {},
         h(
           "div",
           { class: "entry-title" },
-          entry.favourite ? h("span", { class: "star", "aria-label": "Favourite", text: "★" }) : null,
+          entry.favourite ? h("span", { class: "star", "aria-label": "Favourite", text: "\u2605" }) : null,
           h("span", { text: entry.name }),
         ),
-        h("div", { class: "entry-sub", text: entry.url || " " }),
+        h("div", { class: "entry-sub", text: entry.url || " " }),
       ),
       h(
         "div",
@@ -358,6 +373,15 @@
         entry.category ? h("span", { class: "badge", text: entry.category }) : null,
       ),
     );
+    return h("div", { class: "entry-row" }, box, link);
+  }
+
+  function updateExportButton() {
+    const btn = state.exportButton;
+    if (!btn) return;
+    const n = state.selected.size;
+    btn.disabled = n === 0;
+    btn.textContent = n ? `Export as Pastry (${n})` : "Export as Pastry";
   }
 
   // ----- entry details ----------------------------------------------------
@@ -476,6 +500,7 @@
     const locked = entry.locked && !entry.unlocked;
     const actions = [];
     if (!locked) actions.push(h("a", { class: "btn", href: `#/entry/${id}/edit`, text: "Edit" }));
+    actions.push(h("button", { class: "btn", type: "button", text: "Export as Pastry", disabled: locked, onclick: () => openExport([id]) }));
     actions.push(h("button", { class: "btn danger", type: "button", text: "Delete", onclick: () => deleteEntry(entry) }));
     if (entry.locked && entry.unlocked) {
       actions.push(
@@ -563,6 +588,120 @@
     } catch (err) {
       toast(err.message);
     }
+  }
+
+  // ----- Export as Pastry ---------------------------------------------------
+
+  const EXPIRY_CHOICES = [
+    ["5", "5 minutes"], ["15", "15 minutes"], ["60", "1 hour"],
+    ["1440", "24 hours"], ["10080", "7 days"], ["custom", "Custom duration"],
+  ];
+
+  function openExport(ids) {
+    if (!ids.length) return toast("Select at least one entry");
+    const nameInput = h("input", { type: "text", maxlength: "100", value: "Credential package", "aria-label": "Package name" });
+    const pwInput = h("input", { type: "password", maxlength: "256", autocomplete: "new-password", "aria-label": "Package password", class: "mono" });
+    const pwRepeat = h("input", { type: "password", maxlength: "256", autocomplete: "new-password", "aria-label": "Repeat package password" });
+    const genLength = h("input", { type: "range", min: "16", max: "48", value: "24", "aria-label": "Generated length" });
+    const genOutput = h("output", { class: "small muted", text: "24" });
+    genLength.addEventListener("input", () => { genOutput.textContent = genLength.value; });
+    const generate = h("button", {
+      class: "btn small", type: "button", text: "Generate",
+      onclick: () => {
+        const result = generatePassword(Number(genLength.value), { upper: true, lower: true, digits: true, symbols: true });
+        pwInput.value = result.value;
+        pwRepeat.value = result.value;
+        pwInput.type = "text";
+        pwRepeat.type = "text";
+      },
+    });
+    const copyYes = h("input", { type: "radio", name: "allow-copy", value: "yes", checked: true });
+    const copyNo = h("input", { type: "radio", name: "allow-copy", value: "no" });
+    const accessOffline = h("input", { type: "radio", name: "access", value: "offline", checked: true });
+    const accessTimed = h("input", { type: "radio", name: "access", value: "timed", disabled: true });
+    const accessOnce = h("input", { type: "radio", name: "access", value: "one_time", disabled: true });
+    const expirySelect = h("select", { "aria-label": "Expiration" }, EXPIRY_CHOICES.map(([v, t]) => h("option", { value: v, text: t })));
+    expirySelect.value = "1440";
+    const customMinutes = h("input", { type: "number", min: "1", max: "43200", value: "120", "aria-label": "Custom minutes", hidden: true });
+    expirySelect.addEventListener("change", () => { customMinutes.hidden = expirySelect.value !== "custom"; });
+    const error = h("p", { class: "error", role: "alert", hidden: true });
+    const dlg = h("dialog", { "aria-labelledby": "export-title" });
+    const close = () => dlg.close();
+
+    function fail(message) {
+      error.textContent = message;
+      error.hidden = false;
+    }
+
+    async function submit() {
+      error.hidden = true;
+      if (!nameInput.value.trim()) return fail("Give the package a name.");
+      if (pwInput.value.length < MIN_SECRET_LENGTH) return fail(`The package password needs at least ${MIN_SECRET_LENGTH} characters.`);
+      if (pwInput.value !== pwRepeat.value) return fail("The package passwords do not match.");
+      const minutes = Number(expirySelect.value === "custom" ? customMinutes.value : expirySelect.value);
+      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 43200) return fail("Choose an expiry between 1 minute and 30 days.");
+      const body = {
+        entry_ids: ids,
+        name: nameInput.value.trim(),
+        password: pwInput.value,
+        allow_copy: copyYes.checked,
+        access: "offline",
+        expires_in_minutes: minutes,
+      };
+      try {
+        const res = await fetchRaw("POST", "/api/packages/export", body);
+        if (res.status === 401) return redirectToLogin();
+        if (!res.ok) {
+          let detail = `Export failed (${res.status}).`;
+          try { detail = (await res.json()).detail || detail; } catch (err) { /* not JSON */ }
+          return fail(detail);
+        }
+        const blob = await res.blob();
+        const match = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") || "");
+        const url = URL.createObjectURL(blob);
+        const link = h("a", { href: url, download: match ? match[1] : "package.pastry" });
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        close();
+        toast("Package downloaded. Send its password through a different channel.");
+      } catch (err) {
+        fail(err.message);
+      }
+    }
+
+    dlg.append(h(
+      "div",
+      { class: "dialog-body export-body" },
+      h("h2", { id: "export-title", text: `Export ${ids.length} ${ids.length === 1 ? "entry" : "entries"} as Pastry` }),
+      h("p", { text: "The package is encrypted with its own password and contains only the entries listed here." }),
+      h("label", { class: "field" }, h("span", { text: "Package name" }), nameInput),
+      h("label", { class: "field" }, h("span", { text: "Package password (at least 12 characters)" }),
+        h("div", { class: "input-with-action" }, pwInput, generate)),
+      h("div", { class: "row-line" }, h("span", { class: "small", text: "Generator length" }), genLength, genOutput),
+      h("label", { class: "field" }, h("span", { text: "Repeat package password" }), pwRepeat),
+      h("fieldset", { class: "choice" }, h("legend", { text: "Allow copying in the viewer" }),
+        h("label", {}, copyYes, "Yes"), h("label", {}, copyNo, "No")),
+      h("fieldset", { class: "choice" }, h("legend", { text: "Access type" }),
+        h("label", {}, accessOffline, "Normal encrypted package"),
+        h("label", { class: "muted" }, accessTimed, "Time-limited: needs the release service (not available)"),
+        h("label", { class: "muted" }, accessOnce, "One-time: needs the release service (not available)")),
+      h("label", { class: "field" }, h("span", { text: "Advisory expiry" }), expirySelect, customMinutes),
+      h("p", { class: "help", text: "Expiry is advisory. The Pastry viewer enforces it, but a modified viewer or a copy of the file can ignore it." }),
+      error,
+      h("div", { class: "dialog-actions" },
+        h("button", { class: "btn", type: "button", text: "Cancel", onclick: close }),
+        h("button", { class: "btn primary", type: "button", text: "Create package", onclick: submit })),
+    ));
+    dlg.addEventListener("close", () => {
+      pwInput.value = "";
+      pwRepeat.value = "";
+      dlg.remove();
+    });
+    document.body.append(dlg);
+    dlg.showModal();
+    nameInput.focus();
   }
 
   // ----- editor -----------------------------------------------------------
