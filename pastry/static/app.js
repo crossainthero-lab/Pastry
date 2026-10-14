@@ -212,6 +212,7 @@
     if (head === undefined) document.querySelector('[data-nav="all"]').setAttribute("aria-current", "page");
     if (head === "favourites") document.querySelector('[data-nav="favourites"]').setAttribute("aria-current", "page");
     if (head === "settings") document.querySelector('[data-nav="settings"]').setAttribute("aria-current", "page");
+    if (head === "packages") document.querySelector('[data-nav="packages"]').setAttribute("aria-current", "page");
     if (head === "category") {
       document.querySelectorAll("#category-list a").forEach((link) => {
         if (link.dataset.category === arg) link.setAttribute("aria-current", "page");
@@ -237,7 +238,7 @@
     }
     state.openEntryId = nextEntry;
     highlightNav(head, arg);
-    toolbar.hidden = head === "settings";
+    toolbar.hidden = head === "settings" || head === "packages";
     setNavOpen(false);
 
     try {
@@ -266,6 +267,10 @@
         state.listSpec = null;
         await refreshCategories();
         await showSettings();
+      } else if (head === "packages") {
+        state.listSpec = null;
+        await refreshCategories();
+        await showPackages();
       } else {
         location.hash = "#/";
       }
@@ -592,13 +597,29 @@
 
   // ----- Export as Pastry ---------------------------------------------------
 
-  const EXPIRY_CHOICES = [
-    ["5", "5 minutes"], ["15", "15 minutes"], ["60", "1 hour"],
-    ["1440", "24 hours"], ["10080", "7 days"], ["custom", "Custom duration"],
-  ];
+  const AFTER_OPEN_CHOICES = [["5", "5 minutes after opening"], ["15", "15 minutes after opening"],
+    ["60", "1 hour after opening"], ["1440", "24 hours after opening"]];
 
-  function openExport(ids) {
+  function packageStatusText(p) {
+    const labels = { active: "Active", expired: "Expired", revoked: "Revoked", consumed: "Redeemed (one-time)" };
+    if (p.policy === "after_open" && p.state === "active" && !p.expires_at) return "Active (not opened yet)";
+    return labels[p.state] || p.state;
+  }
+
+  function policyText(p) {
+    if (p.policy === "after_open") return `Window of ${Math.round((p.duration_seconds || 0) / 60)} min after opening`;
+    if (p.policy === "absolute") return "Absolute deadline";
+    return "One-time";
+  }
+
+  async function openExport(ids) {
     if (!ids.length) return toast("Select at least one entry");
+    let timed = false;
+    try {
+      timed = Boolean((await api.get("/api/settings")).timed_packages);
+    } catch (err) {
+      if (err.status === 401) return;
+    }
     const nameInput = h("input", { type: "text", maxlength: "100", value: "Credential package", "aria-label": "Package name" });
     const pwInput = h("input", { type: "password", maxlength: "256", autocomplete: "new-password", "aria-label": "Package password", class: "mono" });
     const pwRepeat = h("input", { type: "password", maxlength: "256", autocomplete: "new-password", "aria-label": "Repeat package password" });
@@ -617,16 +638,22 @@
     });
     const copyYes = h("input", { type: "radio", name: "allow-copy", value: "yes", checked: true });
     const copyNo = h("input", { type: "radio", name: "allow-copy", value: "no" });
-    const accessOffline = h("input", { type: "radio", name: "access", value: "offline", checked: true });
-    const accessTimed = h("input", { type: "radio", name: "access", value: "timed", disabled: true });
-    const accessOnce = h("input", { type: "radio", name: "access", value: "one_time", disabled: true });
-    const expirySelect = h("select", { "aria-label": "Expiration" }, EXPIRY_CHOICES.map(([v, t]) => h("option", { value: v, text: t })));
-    expirySelect.value = "1440";
-    const customMinutes = h("input", { type: "number", min: "1", max: "43200", value: "120", "aria-label": "Custom minutes", hidden: true });
-    expirySelect.addEventListener("change", () => { customMinutes.hidden = expirySelect.value !== "custom"; });
+
+    // Access type. Server-enforced choices need public_url to be configured on the server.
+    const modeOffline = h("input", { type: "radio", name: "mode", value: "offline", checked: true });
+    const modeAfter = h("input", { type: "radio", name: "mode", value: "after_open", disabled: !timed });
+    const modeAbsolute = h("input", { type: "radio", name: "mode", value: "absolute", disabled: !timed });
+    const modeOnce = h("input", { type: "radio", name: "mode", value: "one_time", disabled: !timed });
+    const afterSelect = h("select", { "aria-label": "Window after opening" }, AFTER_OPEN_CHOICES.map(([v, t]) => h("option", { value: v, text: t })));
+    const absoluteMinutes = h("input", { type: "number", min: "1", max: "43200", value: "120", "aria-label": "Deadline in minutes from now" });
+    const offlineExpiry = h("select", { "aria-label": "Advisory expiry" }, [
+      ["5", "5 minutes"], ["15", "15 minutes"], ["60", "1 hour"], ["1440", "24 hours"], ["10080", "7 days"],
+    ].map(([v, t]) => h("option", { value: v, text: t })));
+    offlineExpiry.value = "1440";
     const error = h("p", { class: "error", role: "alert", hidden: true });
     const dlg = h("dialog", { "aria-labelledby": "export-title" });
     const close = () => dlg.close();
+    const selectedMode = () => document.querySelector("input[name=mode]:checked")?.value || "offline";
 
     function fail(message) {
       error.textContent = message;
@@ -638,18 +665,23 @@
       if (!nameInput.value.trim()) return fail("Give the package a name.");
       if (pwInput.value.length < MIN_SECRET_LENGTH) return fail(`The package password needs at least ${MIN_SECRET_LENGTH} characters.`);
       if (pwInput.value !== pwRepeat.value) return fail("The package passwords do not match.");
-      const minutes = Number(expirySelect.value === "custom" ? customMinutes.value : expirySelect.value);
-      if (!Number.isInteger(minutes) || minutes < 1 || minutes > 43200) return fail("Choose an expiry between 1 minute and 30 days.");
-      const body = {
-        entry_ids: ids,
-        name: nameInput.value.trim(),
-        password: pwInput.value,
-        allow_copy: copyYes.checked,
-        access: "offline",
-        expires_in_minutes: minutes,
-      };
+      const mode = selectedMode();
       try {
-        const res = await fetchRaw("POST", "/api/packages/export", body);
+        let res;
+        if (mode === "offline") {
+          res = await fetchRaw("POST", "/api/packages/export", {
+            entry_ids: ids, name: nameInput.value.trim(), password: pwInput.value,
+            allow_copy: copyYes.checked, access: "offline", expires_in_minutes: Number(offlineExpiry.value),
+          });
+        } else {
+          const body = {
+            entry_ids: ids, name: nameInput.value.trim(), password: pwInput.value, allow_copy: copyYes.checked,
+            policy: mode,
+            duration_minutes: mode === "after_open" ? Number(afterSelect.value) : null,
+            absolute_minutes: mode === "absolute" ? Number(absoluteMinutes.value) : null,
+          };
+          res = await fetchRaw("POST", "/api/packages", body);
+        }
         if (res.status === 401) return redirectToLogin();
         if (!res.ok) {
           let detail = `Export failed (${res.status}).`;
@@ -665,7 +697,9 @@
         link.remove();
         setTimeout(() => URL.revokeObjectURL(url), 10000);
         close();
-        toast("Package downloaded. Send its password through a different channel.");
+        toast(mode === "offline"
+          ? "Package downloaded. Send its password through a different channel."
+          : "Package created. It stays on this server and can be revoked from Packages.");
       } catch (err) {
         fail(err.message);
       }
@@ -684,11 +718,15 @@
       h("fieldset", { class: "choice" }, h("legend", { text: "Allow copying in the viewer" }),
         h("label", {}, copyYes, "Yes"), h("label", {}, copyNo, "No")),
       h("fieldset", { class: "choice" }, h("legend", { text: "Access type" }),
-        h("label", {}, accessOffline, "Normal encrypted package"),
-        h("label", { class: "muted" }, accessTimed, "Time-limited: needs the release service (not available)"),
-        h("label", { class: "muted" }, accessOnce, "One-time: needs the release service (not available)")),
-      h("label", { class: "field" }, h("span", { text: "Advisory expiry" }), expirySelect, customMinutes),
-      h("p", { class: "help", text: "Expiry is advisory. The Pastry viewer enforces it, but a modified viewer or a copy of the file can ignore it." }),
+        h("label", {}, modeOffline, "Offline encrypted file (opens without the server; expiry is advisory)"),
+        h("div", { class: "indent" }, h("label", { class: "field" }, h("span", { text: "Advisory expiry" }), offlineExpiry)),
+        h("label", { class: timed ? "" : "muted" }, modeAfter, "Expires after opening (server-enforced)"),
+        h("div", { class: "indent" }, afterSelect),
+        h("label", { class: timed ? "" : "muted" }, modeAbsolute, "Absolute deadline (server-enforced), minutes from now"),
+        h("div", { class: "indent" }, absoluteMinutes),
+        h("label", { class: timed ? "" : "muted" }, modeOnce, "One-time (the first successful open uses it up; server-enforced)")),
+      timed ? null : h("p", { class: "warn", text: "Server-enforced packages need public_url in the server's config/pastry.json, set to the HTTPS address recipients use. The options are off until then." }),
+      h("p", { class: "help", text: "Server-enforced packages cannot be opened if the server is unreachable. Revocation and expiry are enforced by the server clock. A recipient who has already opened a package may keep a copy of what they saw." }),
       error,
       h("div", { class: "dialog-actions" },
         h("button", { class: "btn", type: "button", text: "Cancel", onclick: close }),
@@ -702,6 +740,69 @@
     document.body.append(dlg);
     dlg.showModal();
     nameInput.focus();
+  }
+
+  // ----- Packages page ------------------------------------------------------
+
+  async function showPackages() {
+    const data = await api.get("/api/packages");
+    const rows = data.packages.map((p) => {
+      const actions = [];
+      if (p.has_file) {
+        actions.push(h("a", { class: "btn small", href: `/api/packages/${p.id}/file`, download: "", text: "Download" }));
+      }
+      if (p.state === "active") {
+        actions.push(h("button", { class: "btn small", type: "button", text: "Revoke", onclick: () => revokePackage(p) }));
+      }
+      actions.push(h("button", { class: "btn small danger", type: "button", text: "Delete", onclick: () => deletePackage(p) }));
+      return h(
+        "div",
+        { class: "kv pkg" },
+        h("div", { class: "k" }, h("div", { text: p.name }), h("div", { class: "small muted", text: `${p.entry_count} entries · ${policyText(p)}` })),
+        h("div", { class: "v plain" }, h("div", { text: `Created ${formatDate(p.created_at)}` }),
+          h("div", { class: "small muted", text: p.expires_at ? `Expires ${formatDate(p.expires_at)}` : "No expiry yet" })),
+        h("div", { class: "actions wrap" }, h("span", { class: "badge", text: packageStatusText(p) }), actions),
+      );
+    });
+    view.replaceChildren(
+      h("div", { class: "view-head" }, h("h1", { text: "Packages" }), h("span", { class: "muted small", text: `${data.packages.length} total` })),
+      h("p", { class: "help", text: "Server-enforced packages are listed here. Revoke stops future releases. Delete removes the record and the stored copy. Passwords are never stored or shown again." }),
+      rows.length ? h("div", { class: "panel" }, h("div", { class: "panel-body" }, rows)) : h("div", { class: "empty" }, h("h2", { text: "No packages yet" }), h("p", { text: "Select entries and choose Export as Pastry to create one." })),
+    );
+  }
+
+  async function revokePackage(p) {
+    const ok = await dialog({
+      title: "Revoke this package?",
+      message: "Recipients can no longer open it through the server. Copies already opened keep what the recipient saw. This cannot be undone.",
+      confirmLabel: "Revoke",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.post(`/api/packages/${p.id}/revoke`);
+      toast("Package revoked");
+      showPackages();
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  async function deletePackage(p) {
+    const ok = await dialog({
+      title: "Delete this package record?",
+      message: "The server removes the package, its release key and its stored copy. Files already downloaded are not affected.",
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.del(`/api/packages/${p.id}`);
+      toast("Package deleted");
+      showPackages();
+    } catch (err) {
+      toast(err.message);
+    }
   }
 
   // ----- editor -----------------------------------------------------------
