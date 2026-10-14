@@ -1,7 +1,6 @@
 """Run the Pastry app on a real socket in a background thread (tests only)."""
 import datetime
 import socket
-import ssl
 import threading
 import time
 from pathlib import Path

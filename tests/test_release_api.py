@@ -1,17 +1,14 @@
 """Owner package API and public release routes, through the real HTTP stack (TestClient)."""
 import base64
-import json
 import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
 
 from pastry import package as pk
-from pastry import release as rel
-from pastry.release import ReleaseService
 from pastry.release_client import ReleaseRefused, open_server_package
 from pastry.web import create_app
-from tests.conftest import BASE_URL, PASSWORD, SAMPLE_ENTRY, login, write_headers
+from tests.conftest import BASE_URL, SAMPLE_ENTRY, login, write_headers
 
 URL = "https://pastry.example.ts.net"
 PKG_PW = "package password 2026"
@@ -256,9 +253,7 @@ def test_package_writes_need_csrf(owner):
 
 def test_another_owners_package_cannot_be_reached_by_id(owner, rel_app, provisioned, clock):
     """Simulates a second account's package. Its id must yield 404 for this owner everywhere."""
-    store = owner.app.state.ctx.store
     svc = owner.app.state.ctx.release_service()
-    from pastry import crypto
     from pastry.release import NewPackage
     import secrets as _secrets
 

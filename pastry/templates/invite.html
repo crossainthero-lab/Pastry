@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Create your account · Pastry{% endblock %}
+{% block body %}
+<main class="login-wrap">
+  {% if done %}
+  <div class="login-card">
+    <div class="wordmark large">Pastry</div>
+    <p class="notice" role="status">Your account is ready. Sign in with the username the owner gave you and the password you just chose.</p>
+    <a class="btn primary block" href="/login">Go to sign in</a>
+  </div>
+  {% else %}
+  <form class="login-card" method="post" action="/invite/{{ token }}" autocomplete="off">
+    <div class="wordmark large">Pastry</div>
+    <p class="muted">Choose your own master password. The owner never sees it. Your vault is encrypted with a key derived from this password, so a forgotten password cannot be recovered by anyone.</p>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <label class="field">
+      <span>New master password (at least 12 characters)</span>
+      <input name="password" type="password" autocomplete="new-password" required minlength="12" maxlength="512">
+    </label>
+    <label class="field">
+      <span>Repeat master password</span>
+      <input name="repeat" type="password" autocomplete="new-password" required minlength="12" maxlength="512">
+    </label>
+    <button class="btn primary block" type="submit">Create account</button>
+  </form>
+  {% endif %}
+</main>
+{% endblock %}

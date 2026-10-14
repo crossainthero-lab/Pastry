@@ -29,7 +29,10 @@ from . import crypto, package
 from .auth import AuthFile
 from .config import Settings
 from .db import SCHEMA_VERSION, Store
+from . import accounts
 from . import release as releasemod
+from .backup import BackupError, create_backup, verify_backup
+from .migrate import MigrationError, migrate_v3_to_v4
 from .package import AFTER_OPEN_SECONDS, MAX_ABSOLUTE_SECONDS
 from .ratelimit import SqlRateLimiter
 from .release import ReleaseError, ReleaseService
@@ -172,6 +175,12 @@ class PasswordChangeIn(BaseModel):
     new: str = Field(min_length=authmod.MIN_PASSWORD_LEN, max_length=authmod.MAX_PASSWORD_LEN)
 
 
+class InviteIn(BaseModel):
+    # Module-level on purpose: FastAPI cannot resolve a model defined inside create_app under
+    # `from __future__ import annotations`, and would read the body as query parameters.
+    username: str = Field(min_length=1, max_length=64)
+
+
 class PackageCreateIn(BaseModel):
     entry_ids: list[int] = Field(min_length=1, max_length=200)
     name: str = Field(min_length=1, max_length=100)
@@ -279,7 +288,15 @@ class AppContext:
         return self.settings.entry_idle_minutes * 60
 
     def vault(self, session: Session) -> Vault:
-        return Vault(self.store, session.dek, self.settings.kdf)
+        return Vault(self.store, session.dek, self.settings.kdf, session.account_id)
+
+    def account_epoch(self, account_id: int) -> int | None:
+        """The current session epoch of an account, or None if it is missing, disabled or the owner's
+        configuration is unavailable. A session whose epoch differs is no longer valid."""
+        if account_id == accounts.OWNER_ID:
+            auth = self.auth.get()
+            return None if auth is None else auth.session_epoch
+        return accounts.current_epoch(self.store, account_id)
 
 
 def _client_ip(request: Request) -> str:
@@ -374,13 +391,22 @@ def create_app(
 
     def current_session(request: Request, touch: bool = True) -> Session:
         ctx.require_schema()
-        auth = ctx.auth.get()
         token = request.cookies.get(ctx.cookie_name)
-        if auth is None or not token:
+        if not token:
             raise NotAuthenticated()
-        session = ctx.sessions.get(token, epoch=auth.session_epoch, touch=touch)
+        session = ctx.sessions.get(token, epoch=None, touch=touch)
         if session is None:
             raise NotAuthenticated()
+        # Each account has its own epoch. A password change, or a disabled account, invalidates
+        # that account's sessions only.
+        if ctx.account_epoch(session.account_id) != session.epoch:
+            ctx.sessions.destroy(token)
+            raise NotAuthenticated()
+        return session
+
+    def require_owner(session: Session) -> Session:
+        if session.role != "owner":
+            raise HTTPException(403, "Only the owner can do that.")
         return session
 
     def require_session(request: Request) -> Session:
@@ -440,10 +466,9 @@ def create_app(
     ):
         if not _same_origin(request, ctx):
             return _login_page(request, 403, error="Request refused.")
-        try:
-            ctx.require_schema()
-        except HTTPException as exc:
-            return _login_page(request, 503, error=str(exc.detail))
+        version = ctx.store.schema_version() if ctx.settings.db_path.exists() else 0
+        if version not in (3, 4):
+            return _login_page(request, 503, error="The vault database is not compatible. Run: pastry migrate")
         username = username.strip()
         ip_key = f"login-ip:{_client_ip(request)}"
         user_key = f"login-user:{username.lower()}"
@@ -454,14 +479,38 @@ def create_app(
                 error=f"Too many failed attempts. Try again in {_minutes_from(retry)} minute(s).",
                 username=username,
             )
-
         auth = ctx.auth.get()
         if auth is None:
             return _login_page(request, 503, error="Pastry is not set up yet. Run: pastry setup")
 
-        dek = authmod.try_unlock(auth, password)
-        user_ok = hmac.compare_digest(username.encode(), auth.username.encode())
-        if dek is None or not user_ok:
+        is_owner = hmac.compare_digest(username.encode(), auth.username.encode())
+        account_id, role, epoch, dek = None, None, None, None
+        if is_owner:
+            dek = authmod.try_unlock(auth, password)
+            if dek is not None and version == 3:
+                # First owner sign-in after an upgrade: backup, verify, then migrate (no decryption needed).
+                try:
+                    backup = create_backup(settings, settings.backup_dir)
+                    verify_backup(settings, backup)
+                    migrate_v3_to_v4(ctx.store)
+                except (BackupError, MigrationError, sqlite3.Error) as exc:
+                    crypto.wipe(dek)
+                    log.error("automatic migration refused: %s", exc)
+                    return _login_page(request, 503, error="Automatic migration failed. The database is unchanged.")
+                ctx._schema_ok = True
+            if dek is not None:
+                account_id, role, epoch = 0, "owner", auth.session_epoch
+        elif version == 4:
+            opened = accounts.open_login(ctx.store, username, password)
+            if opened is not None:
+                account, dek = opened
+                account_id, role, epoch = account.id, "user", account.session_epoch
+        else:
+            # Non-owner accounts cannot sign in until the owner has completed the migration.
+            ctx.login_limiter.record_failure(ip_key)
+            return _login_page(request, 503, error="The vault must be migrated first. The owner signs in once.")
+
+        if dek is None or account_id is None:
             crypto.wipe(dek)
             ctx.login_limiter.record_failure(ip_key)
             ctx.login_limiter.record_failure(user_key)
@@ -469,7 +518,8 @@ def create_app(
 
         ctx.login_limiter.reset(ip_key)
         ctx.login_limiter.reset(user_key)
-        token, _ = ctx.sessions.create(auth.username, dek, auth.session_epoch)
+        token, _ = ctx.sessions.create(username if role == "user" else auth.username, dek, epoch,
+                                       account_id=account_id, role=role)
         response = RedirectResponse("/", status_code=303)
         response.set_cookie(ctx.cookie_name, token, httponly=True, secure=settings.cookie_secure,
                             samesite="strict", path="/")
@@ -517,30 +567,103 @@ def create_app(
 
     @app.post("/api/account/password", status_code=204)
     def change_account_password(body: PasswordChangeIn, request: Request, session: Session = Depends(require_write)):
-        """Change the master password. Keeps the vault key, so all entries stay accessible.
-        Bumps the session epoch, which signs out every session, including this one."""
-        limiter_key = f"password-change:{session.username}"
+        """Change the signed-in account's master password. Its vault key is re-wrapped, not re-encrypted.
+        Only this account's sessions are invalidated (its epoch changes)."""
+        limiter_key = f"password-change:{session.account_id}"
         retry = ctx.login_limiter.blocked_for(limiter_key)
         if retry:
             raise HTTPException(429, f"Too many attempts. Wait {_minutes_from(retry)} minute(s).")
         try:
-            authmod.change_password(settings.auth_path, body.current, body.new)
-        except authmod.AuthError as exc:
+            if session.account_id == accounts.OWNER_ID:
+                authmod.change_password(settings.auth_path, body.current, body.new)
+            else:
+                accounts.change_password(ctx.store, session.account_id, body.current, body.new, ctx.wall_clock())
+        except (authmod.AuthError, accounts.AccountError) as exc:
             if "current password" in str(exc):
                 ctx.login_limiter.record_failure(limiter_key)
                 raise HTTPException(403, str(exc)) from exc
             raise HTTPException(422, str(exc)) from exc
         ctx.login_limiter.reset(limiter_key)
-        ctx.sessions.destroy_all()
+        ctx.sessions.destroy(request.cookies.get(ctx.cookie_name))
         response = Response(status_code=204)
         response.delete_cookie(ctx.cookie_name, path="/", secure=settings.cookie_secure,
                                httponly=True, samesite="strict")
         return response
 
+    # ----- accounts (owner only), invitations, and the disabled sharing endpoints -----
+
+    @app.get("/api/users")
+    def list_users(session: Session = Depends(require_session)):
+        require_owner(session)
+        auth = ctx.auth.get()
+        now = ctx.wall_clock()
+        return {
+            "accounts": accounts.list_accounts(ctx.store, auth.username),
+            "invitations": accounts.pending_invitations(ctx.store, now),
+        }
+
+    @app.post("/api/users/invitations", status_code=201)
+    def create_invitation(body: InviteIn, session: Session = Depends(require_write)):
+        require_owner(session)
+        auth = ctx.auth.get()
+        try:
+            token = accounts.create_invitation(ctx.store, body.username, "user", auth.username, auth.username,
+                                               ctx.wall_clock())
+        except (accounts.AccountError, authmod.AuthError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        # The path is shown once. The full address depends on the server's public address.
+        return {"token": token, "path": f"/invite/{token}", "username": body.username.strip(),
+                "expires_in_hours": accounts.INVITE_TTL_SECONDS // 3600}
+
+    @app.post("/api/users/{account_id}/disable", status_code=204)
+    def disable_user(account_id: int, session: Session = Depends(require_write)):
+        require_owner(session)
+        if account_id == accounts.OWNER_ID:
+            raise HTTPException(422, "The owner account cannot be disabled here.")
+        try:
+            accounts.disable(ctx.store, account_id, ctx.wall_clock())
+        except accounts.AccountError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        ctx.sessions.destroy_account(account_id)
+        return Response(status_code=204)
+
+    @app.get("/invite/{token}", response_class=HTMLResponse)
+    def invite_page(token: str, request: Request):
+        ctx.require_schema()
+        return templates.TemplateResponse(request, "invite.html", {"token": token, "error": "", "done": False})
+
+    @app.post("/invite/{token}", response_class=HTMLResponse)
+    def invite_accept(token: str, request: Request,
+                      password: str = Form(default="", max_length=512),
+                      repeat: str = Form(default="", max_length=512)):
+        if not _same_origin(request, ctx):
+            return templates.TemplateResponse(request, "invite.html", {"token": token, "error": "Request refused.",
+                                                                       "done": False}, status_code=403)
+        ctx.require_schema()
+        if password != repeat:
+            return templates.TemplateResponse(request, "invite.html", {"token": token,
+                                                                       "error": "The passwords do not match.",
+                                                                       "done": False}, status_code=422)
+        auth = ctx.auth.get()
+        try:
+            accounts.accept_invitation(ctx.store, token, password, auth.username, settings.kdf, ctx.wall_clock())
+        except (accounts.AccountError, authmod.AuthError) as exc:
+            return templates.TemplateResponse(request, "invite.html", {"token": token, "error": str(exc),
+                                                                       "done": False}, status_code=422)
+        return templates.TemplateResponse(request, "invite.html", {"token": token, "error": "", "done": True})
+
+    # Entry sharing is deliberately disabled. See docs/MULTIUSER-CRYPTO.md section 7.
+    @app.api_route("/api/shares", methods=["GET", "POST", "PUT", "DELETE"])
+    @app.api_route("/api/shares/{share_id}", methods=["GET", "POST", "PUT", "DELETE"])
+    def sharing_disabled(share_id: str = ""):
+        raise HTTPException(501, "Entry sharing is not available in this version. "
+                                 "See docs/MULTIUSER-CRYPTO.md.")
+
     @app.get("/api/settings")
     def get_settings(session: Session = Depends(require_session)):
         return {
             "username": session.username,
+            "role": session.role,
             "session_timeout_minutes": _minutes_from(int(ctx.sessions.idle_seconds)),
             "entry_idle_minutes": settings.entry_idle_minutes,
             "backups": _latest_backup(settings),
@@ -550,6 +673,7 @@ def create_app(
 
     @app.put("/api/settings")
     def put_settings(body: SettingsIn, session: Session = Depends(require_write)):
+        require_owner(session)
         ctx.store.set_setting("session_timeout_minutes", str(body.session_timeout_minutes))
         ctx.sessions.idle_seconds = body.session_timeout_minutes * 60
         return {"username": session.username, "session_timeout_minutes": body.session_timeout_minutes}
@@ -728,7 +852,7 @@ def create_app(
                                 _package_meta_aad(cap_hash))
         from .release import NewPackage
 
-        pkg = NewPackage(owner=session.username, capability=capability, policy=body.policy,
+        pkg = NewPackage(owner=str(session.account_id), capability=capability, policy=body.policy,
                          duration_seconds=duration, absolute_expires_at=absolute,
                          entry_count=len(entries), meta_blob=meta_blob, file_blob=b"",
                          k_r=k_r, k_auth=k_auth)
@@ -740,11 +864,11 @@ def create_app(
                 now=datetime.fromtimestamp(now, timezone.utc),
             )
         except package.PackageError as exc:
-            svc.delete(session.username, package_id)
+            svc.delete(str(session.account_id), package_id)
             raise HTTPException(422, str(exc)) from exc
         finally:
             crypto.wipe(bytearray(k_r))
-        svc.set_file(package_id, data, session.username)
+        svc.set_file(package_id, data, str(session.account_id))
         return Response(content=data, media_type="application/octet-stream", headers={
             "Content-Disposition": f'attachment; filename="{package.safe_filename(body.name)}"',
             "X-Pastry-Package-Id": str(package_id),
@@ -755,7 +879,7 @@ def create_app(
         svc = ctx.release_service()
         svc.sweep()
         out = []
-        for item in svc.list_for(session.username):
+        for item in svc.list_for(str(session.account_id)):
             meta = json.loads(crypto.open_sealed(session.dek, item.pop("meta_blob"),
                                                  _package_meta_aad(item.pop("cap_hash"))))
             item["name"] = meta["name"]
@@ -765,18 +889,18 @@ def create_app(
 
     @app.get("/api/packages/{package_id}/file")
     def download_package(package_id: int, session: Session = Depends(require_session)):
-        data = ctx.release_service().get_file(session.username, package_id)
+        data = ctx.release_service().get_file(str(session.account_id), package_id)
         return Response(content=data, media_type="application/octet-stream", headers={
             "Content-Disposition": 'attachment; filename="package.pastry"'})
 
     @app.post("/api/packages/{package_id}/revoke", status_code=204)
     def revoke_package(package_id: int, session: Session = Depends(require_write)):
-        ctx.release_service().revoke(session.username, package_id)
+        ctx.release_service().revoke(str(session.account_id), package_id)
         return Response(status_code=204)
 
     @app.delete("/api/packages/{package_id}", status_code=204)
     def delete_package(package_id: int, session: Session = Depends(require_write)):
-        ctx.release_service().delete(session.username, package_id)
+        ctx.release_service().delete(str(session.account_id), package_id)
         return Response(status_code=204)
 
     # ----- server-enforced packages: public release API (no vault session) -----

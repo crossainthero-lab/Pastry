@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 import getpass
 import os
 import sqlite3
@@ -233,7 +234,7 @@ def cmd_migrate(_args: argparse.Namespace, ctx: Context) -> int:
         if version in (1, 2):
             migrate_v2_to_v3(store)
         info = migrate_v3_to_v4(store)
-    except (MigrationError, BackupError) as exc:
+    except (MigrationError, BackupError, sqlite3.Error) as exc:
         raise CliError(f"Migration failed and was rolled back; the database is unchanged. ({exc})") from exc
     finally:
         crypto.wipe(dek)
@@ -279,21 +280,61 @@ def cmd_inspect(args: argparse.Namespace, _ctx: Context) -> int:
     return 0
 
 
+def _accounts_store(ctx: Context) -> Store:
+    store = Store(ctx.settings.db_path)
+    if not store.exists():
+        raise CliError("No vault database found. Run: pastry setup")
+    if store.schema_version() != 4:
+        raise CliError("The vault database must be on schema v4. Run: pastry migrate")
+    return store
+
+
 def cmd_list_users(_args: argparse.Namespace, ctx: Context) -> int:
+    from . import accounts
+
+    store = _accounts_store(ctx)
     auth = authmod.read_auth(ctx.settings.auth_path)
-    print("Accounts:")
-    print(f"  {auth.username}  (owner)")
-    print("Multi-user accounts are disabled in this version. See SECURITY-REVIEW.md.")
+    print(f"{'ID':>4}  {'USERNAME':<24} {'ROLE':<8} STATUS")
+    for account in accounts.list_accounts(store, auth.username):
+        status = "disabled" if account["disabled"] else "active"
+        print(f"{account['id']:>4}  {account['username']:<24} {account['role']:<8} {status}")
+    pending = accounts.pending_invitations(store, time.time())
+    if pending:
+        print(f"\nPending invitations: {len(pending)} (each works once and expires)")
     return 0
 
 
-def cmd_multi_user_disabled(_args: argparse.Namespace, _ctx: Context) -> int:
-    print(
-        "error: multi-user accounts are not available in Pastry 1.1. The per-user key design is "
-        "documented in SECURITY-REVIEW.md but not implemented, so no account is created or disabled.",
-        file=sys.stderr,
-    )
-    return 2
+def cmd_create_user(_args: argparse.Namespace, ctx: Context) -> int:
+    from . import accounts
+
+    store = _accounts_store(ctx)
+    auth = authmod.read_auth(ctx.settings.auth_path)
+    username = ctx.prompt_text("Username for the new account: ").strip()
+    try:
+        token = accounts.create_invitation(store, username, "user", auth.username, auth.username, time.time())
+    except (accounts.AccountError, authmod.AuthError) as exc:
+        raise CliError(str(exc)) from exc
+    base = ctx.settings.public_url.rstrip("/") if ctx.settings.public_url else "<your Pastry address>"
+    print(f"Invitation for '{username}' created. Send this link through a channel you trust:")
+    print(f"  {base}/invite/{token}")
+    print(f"It works once and expires in {accounts.INVITE_TTL_SECONDS // 3600} hours. The invitee chooses their own")
+    print("master password. The owner never sees it, and no default password exists.")
+    return 0
+
+
+def cmd_disable_user(args: argparse.Namespace, ctx: Context) -> int:
+    from . import accounts
+
+    store = _accounts_store(ctx)
+    auth = authmod.read_auth(ctx.settings.auth_path)
+    if args.username.strip().lower() == auth.username.lower():
+        raise CliError("The owner account cannot be disabled.")
+    account_id = accounts.find_id(store, args.username.strip())
+    if account_id is None:
+        raise CliError(f"No account named '{args.username}'.")
+    accounts.disable(store, account_id, time.time())
+    print(f"Disabled '{args.username}'. Its sessions can no longer be used, and its data is kept encrypted.")
+    return 0
 
 
 def cmd_restore(args: argparse.Namespace, ctx: Context) -> int:
@@ -345,9 +386,11 @@ def build_parser() -> argparse.ArgumentParser:
     username.add_argument("--username", help="new username (prompted if omitted)")
     username.set_defaults(func=cmd_set_username)
     admin.add_parser("status", help="show configuration without secrets").set_defaults(func=cmd_status)
-    admin.add_parser("list-users", help="list accounts").set_defaults(func=cmd_list_users)
-    admin.add_parser("create-user", help="(not available in 1.1)").set_defaults(func=cmd_multi_user_disabled)
-    admin.add_parser("disable-user", help="(not available in 1.1)").set_defaults(func=cmd_multi_user_disabled)
+    admin.add_parser("list-users", help="list accounts and their status").set_defaults(func=cmd_list_users)
+    admin.add_parser("create-user", help="create an invitation for a new account").set_defaults(func=cmd_create_user)
+    disable = admin.add_parser("disable-user", help="disable an account and end its sessions")
+    disable.add_argument("username")
+    disable.set_defaults(func=cmd_disable_user)
 
     sub.add_parser("migrate", help="upgrade the vault database from schema v1 to v2").set_defaults(func=cmd_migrate)
 

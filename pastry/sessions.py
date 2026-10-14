@@ -30,6 +30,8 @@ class Session:
     created: float
     last_seen: float
     sid: str = ""
+    account_id: int = 0          # 0 is the owner; others are in the users table
+    role: str = "owner"
     # Entry id -> (separate-password key, time it was last used).
     unlocked: dict[int, tuple[bytearray, float]] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -93,7 +95,8 @@ class SessionStore:
     def now(self) -> float:
         return self._clock()
 
-    def create(self, username: str, dek: bytearray, epoch: int) -> tuple[str, Session]:
+    def create(self, username: str, dek: bytearray, epoch: int, account_id: int = 0,
+               role: str = "owner") -> tuple[str, Session]:
         token = secrets.token_urlsafe(32)  # 256 bits from the OS CSPRNG
         digest = _digest(token)
         now = self._clock()
@@ -102,6 +105,8 @@ class SessionStore:
             dek=dek,
             csrf=secrets.token_urlsafe(32),
             epoch=epoch,
+            account_id=account_id,
+            role=role,
             created=now,
             last_seen=now,
             sid=digest[:16],
@@ -110,7 +115,8 @@ class SessionStore:
             self._sessions[digest] = session
         return token, session
 
-    def get(self, token: str | None, epoch: int, touch: bool = True) -> Session | None:
+    def get(self, token: str | None, epoch: int | None = None, touch: bool = True) -> Session | None:
+        """Look up a session. The caller checks the account's current epoch when epoch is None."""
         if not token:
             return None
         digest = _digest(token)
@@ -120,7 +126,7 @@ class SessionStore:
             if session is None:
                 return None
             expired = (
-                session.epoch != epoch
+                (epoch is not None and session.epoch != epoch)
                 or now - session.last_seen > self.idle_seconds
                 or now - session.created > self.max_seconds
             )
@@ -145,6 +151,15 @@ class SessionStore:
                 for digest, s in self._sessions.items()
             ]
         return sorted(items, key=lambda item: item["created"])
+
+    def destroy_account(self, account_id: int) -> int:
+        """Drop every session of one account (used when that account is disabled)."""
+        with self._lock:
+            doomed = [d for d, s in self._sessions.items() if s.account_id == account_id]
+            removed = [self._sessions.pop(d) for d in doomed]
+        for session in removed:
+            session.wipe()
+        return len(removed)
 
     def destroy(self, token: str | None) -> None:
         if not token:

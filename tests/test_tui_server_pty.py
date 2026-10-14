@@ -1,6 +1,5 @@
 """Real `pastry open` against a live release server, driven in a pseudo-terminal."""
 import os
-import socket
 import sys
 from pathlib import Path
 

@@ -112,16 +112,19 @@ class Vault:
     changed while protected.
     """
 
-    def __init__(self, store: Store, dek: bytes | bytearray, kdf: KdfParams):
+    def __init__(self, store: Store, dek: bytes | bytearray, kdf: KdfParams, account_id: int = 0):
         self.store = store
         self.dek = dek
         self.kdf = kdf
+        # Every query is scoped to this account. An entry id that belongs to another account
+        # is reported as "not found", so IDs cannot be used to reach other vaults.
+        self.account_id = account_id
 
     # ----- helpers -------------------------------------------------------
 
-    @staticmethod
-    def _fetch(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row:
-        row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+    def _fetch(self, conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row:
+        row = conn.execute("SELECT * FROM entries WHERE id = ? AND owner_id = ?",
+                           (entry_id, self.account_id)).fetchone()
         if row is None:
             raise VaultError("not_found", "Entry not found.")
         return row
@@ -152,7 +155,8 @@ class Vault:
 
     def _read_rows(self) -> list[sqlite3.Row]:
         with self.store.connect() as conn:
-            return conn.execute("SELECT * FROM entries ORDER BY id").fetchall()
+            return conn.execute("SELECT * FROM entries WHERE owner_id = ? ORDER BY id",
+                                (self.account_id,)).fetchall()
 
     def _seal_meta(self, uid: str, meta: dict) -> bytes:
         return crypto.seal(self.dek, _json(meta), meta_aad(uid))
@@ -211,8 +215,8 @@ class Vault:
         full = {**meta, **lock_fields, "created_at": now, "updated_at": now}
         with self.store.transaction() as conn:
             cur = conn.execute(
-                "INSERT INTO entries (uid, meta_blob, content_blob) VALUES (?, ?, ?)",
-                (uid, self._seal_meta(uid, full), content_blob),
+                "INSERT INTO entries (uid, meta_blob, content_blob, owner_id) VALUES (?, ?, ?, ?)",
+                (uid, self._seal_meta(uid, full), content_blob, self.account_id),
             )
             return int(cur.lastrowid)
 
@@ -232,13 +236,13 @@ class Vault:
             else:
                 content_blob = crypto.seal(self.dek, _json(content), content_aad(uid, False))
             conn.execute(
-                "UPDATE entries SET meta_blob = ?, content_blob = ? WHERE id = ?",
-                (self._seal_meta(uid, full), content_blob, entry_id),
+                "UPDATE entries SET meta_blob = ?, content_blob = ? WHERE id = ? AND owner_id = ?",
+                (self._seal_meta(uid, full), content_blob, entry_id, self.account_id),
             )
 
     def delete(self, entry_id: int) -> None:
         with self.store.transaction() as conn:
-            cur = conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+            cur = conn.execute("DELETE FROM entries WHERE id = ? AND owner_id = ?", (entry_id, self.account_id))
             if cur.rowcount == 0:
                 raise VaultError("not_found", "Entry not found.")
 
@@ -271,8 +275,8 @@ class Vault:
                 raise VaultError("conflict", "The entry changed; please try again.")
             full = {**current, **new_meta_lock, "updated_at": _now()}
             conn.execute(
-                "UPDATE entries SET meta_blob = ?, content_blob = ? WHERE id = ?",
-                (self._seal_meta(row["uid"], full), content_blob, entry_id),
+                "UPDATE entries SET meta_blob = ?, content_blob = ? WHERE id = ? AND owner_id = ?",
+                (self._seal_meta(row["uid"], full), content_blob, entry_id, self.account_id),
             )
 
     def enable_protection(self, entry_id: int, password: str) -> None:
@@ -393,8 +397,8 @@ class Vault:
                     lock = {"locked": False, "lock_salt": None, "lock_kdf": None}
                 full = {**meta, **lock, "created_at": str(item["created_at"]), "updated_at": str(item["updated_at"])}
                 conn.execute(
-                    "INSERT INTO entries (uid, meta_blob, content_blob) VALUES (?, ?, ?)",
-                    (uid, self._seal_meta(uid, full), content_blob),
+                    "INSERT INTO entries (uid, meta_blob, content_blob, owner_id) VALUES (?, ?, ?, ?)",
+                    (uid, self._seal_meta(uid, full), content_blob, self.account_id),
                 )
                 imported += 1
         return {"imported": imported, "skipped": skipped}

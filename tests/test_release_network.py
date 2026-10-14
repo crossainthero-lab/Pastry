@@ -5,10 +5,9 @@ import threading
 import pytest
 from fastapi.testclient import TestClient
 
-from pastry import package as pk
 from pastry.release_client import HttpTransport, ReleaseRefused, TransportError, open_server_package
 from pastry.web import create_app
-from tests.conftest import BASE_URL, PASSWORD, SAMPLE_ENTRY, login, write_headers
+from tests.conftest import BASE_URL, SAMPLE_ENTRY, login, write_headers
 from tests.netserver import ServerThread, make_self_signed
 from tests.test_release_api import PKG_PW, SECRET_PW
 
@@ -60,7 +59,6 @@ def test_self_signed_certificate_is_rejected_by_default(net_app, package_file, t
     """TLS verification stays on: a certificate the system does not trust must fail."""
     owner, data = package_file
     cert, key, _ = make_self_signed(tmp_path)
-    port_holder = {}
     with ServerThread(net_app, certfile=cert, keyfile=key) as server:
         url = f"https://127.0.0.1:{server.port}"
         with pytest.raises(TransportError):

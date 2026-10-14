@@ -50,9 +50,14 @@ def test_fixture_is_schema_v1_with_plaintext_timestamps(v1_home):
 
 
 def test_migration_preserves_entries_and_separate_password(v1_home):
+    from pastry.migrate import migrate_v3_to_v4
+
     store = Store(v1_home.db_path)
     assert migrate_v1_to_v2(store, _dek(v1_home)) == 2
     assert store.schema_version() == 2
+    migrate_v2_to_v3(store)
+    migrate_v3_to_v4(store)  # the full chain a real upgrade runs
+    assert store.schema_version() == 4
 
     dek = _dek(v1_home)
     vault = Vault(store, dek, FAST_KDF)
