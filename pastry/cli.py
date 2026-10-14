@@ -88,7 +88,15 @@ def cmd_start(args: argparse.Namespace, ctx: Context) -> int:
     settings = ctx.settings
     if not settings.auth_path.exists():
         raise CliError("Pastry is not set up yet. Run: pastry setup")
-    Store(settings.db_path).require_current()
+    store = Store(settings.db_path)
+    store.require_current()
+    import time as _time
+
+    from .release import sweep_expired
+
+    erased = sweep_expired(store, _time.time())  # erase release keys of packages already past their deadline
+    if erased:
+        print(f"Erased release material for {erased} expired package(s).")
     host = args.host or settings.host
     port = args.port or settings.port
     if host not in ("127.0.0.1", "localhost", "::1"):
@@ -255,11 +263,19 @@ def cmd_inspect(args: argparse.Namespace, _ctx: Context) -> int:
         raise CliError(str(exc)) from exc
     print(f"Package          : {header.name}")
     print(f"Created (UTC)    : {header.created_at}")
-    print(f"Access type      : {header.access} (opens without the server)")
+    if header.is_server:
+        print("Access type      : server-enforced (needs the release server to open)")
+    else:
+        print("Access type      : offline (opens without the server)")
     print(f"Copy allowed     : {'yes' if header.allow_copy else 'no'} (enforced by the viewer only)")
     print(f"Expiry           : {header.expires_at or 'none'} (advisory)")
     print(f"File size        : {path.stat().st_size} bytes")
     print("Contents         : encrypted. Opening needs the package password.")
+    if header.is_server:
+        policy = header.policy or {}
+        print(f"Enforcement      : server-enforced ({policy.get('type')})")
+        print(f"Release server   : {header.release_url}")
+        print("                   Opening contacts that server. It is never contacted by `inspect`.")
     return 0
 
 

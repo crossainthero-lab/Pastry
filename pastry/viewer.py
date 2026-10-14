@@ -38,6 +38,13 @@ class Viewer:
     revealed_until: float = 0.0
     message: str = ""
     _clear_timer: object | None = field(default=None, repr=False)
+    # Server-enforced packages: the release server's expiry, and a check that runs every poll_seconds.
+    server_expires_at: str | None = None
+    status_check: Callable[[], str] | None = None
+    poll_seconds: float = 30.0
+    closed_reason: str = ""
+    _last_poll: float = field(default=-1e9, repr=False)
+    _poll_failures: int = field(default=0, repr=False)
 
     # ----- rows -----
 
@@ -128,9 +135,44 @@ class Viewer:
     # ----- expiry -----
 
     def expired(self) -> bool:
+        if self.server_expires_at:
+            return self.now() >= datetime.fromisoformat(self.server_expires_at)
         return self.header.expired(self.now())
 
+    def check_server(self) -> None:
+        """Ask the release server whether the package is still active. Fails closed:
+        two failed checks in a row close the view, because the server may have revoked it."""
+        if self.status_check is None or self.closed_reason:
+            return
+        if self.mono() - self._last_poll < self.poll_seconds:
+            return
+        self._last_poll = self.mono()
+        try:
+            state = self.status_check()
+        except Exception:  # any transport or refusal: treated as "cannot confirm"
+            self._poll_failures += 1
+            if self._poll_failures >= 2:
+                self.closed_reason = "Lost contact with the release server. Secrets were closed."
+            return
+        self._poll_failures = 0
+        if state != "active":
+            self.closed_reason = {
+                "expired": "This package has expired. Secrets were closed.",
+                "revoked": "The owner revoked this package. Secrets were closed.",
+                "consumed": "This one-time package was already redeemed. Secrets were closed.",
+            }.get(state, "The release server no longer releases this package. Secrets were closed.")
+
+    def wipe_secrets(self) -> None:
+        """Best effort: drop references to decrypted data. Python cannot guarantee erasure."""
+        self.hide()
+        self.entries = []
+        self.message = ""
+
     def expiry_text(self) -> str:
+        if self.server_expires_at:
+            remaining = datetime.fromisoformat(self.server_expires_at) - self.now()
+            seconds = int(remaining.total_seconds())
+            return "Expired" if seconds <= 0 else f"Server-enforced: closes in {max(1, seconds // 60)} min"
         if not self.header.expires_at:
             return "No expiry set"
         remaining = datetime.fromisoformat(self.header.expires_at) - self.now()

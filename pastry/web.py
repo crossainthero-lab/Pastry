@@ -360,6 +360,10 @@ def create_app(
     async def _vault_error(request: Request, exc: VaultError):
         return JSONResponse({"detail": exc.message, "code": exc.code}, status_code=ERROR_STATUS.get(exc.code, 400))
 
+    @app.exception_handler(ReleaseError)
+    async def _release_error_handler(request: Request, exc: ReleaseError):
+        return JSONResponse({"detail": exc.message, "code": exc.code}, status_code=exc.status)
+
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError):
         messages = [str(err.get("msg", "")) for err in exc.errors()][:3]
@@ -540,6 +544,8 @@ def create_app(
             "session_timeout_minutes": _minutes_from(int(ctx.sessions.idle_seconds)),
             "entry_idle_minutes": settings.entry_idle_minutes,
             "backups": _latest_backup(settings),
+            # Timed packages need an HTTPS address recipients can reach (public_url in config).
+            "timed_packages": bool(settings.public_url),
         }
 
     @app.put("/api/settings")
@@ -747,6 +753,7 @@ def create_app(
     @app.get("/api/packages")
     def list_packages(session: Session = Depends(require_session)):
         svc = ctx.release_service()
+        svc.sweep()
         out = []
         for item in svc.list_for(session.username):
             meta = json.loads(crypto.open_sealed(session.dek, item.pop("meta_blob"),

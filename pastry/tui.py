@@ -6,7 +6,10 @@ import curses
 import os
 from pathlib import Path
 
+import base64
+
 from . import package
+from . import release_client
 from .viewer import Viewer
 
 KEY_ESC = 27
@@ -106,11 +109,16 @@ def _run_viewer(stdscr, viewer: Viewer, path: Path, delete_on_expiry: bool) -> s
     mode = "list"
     stdscr.timeout(TICK_MS)
     while True:
-        if viewer.expired():
+        viewer.check_server()  # server-enforced packages: ask the release server (rate-limited by poll_seconds)
+        if viewer.expired() or viewer.closed_reason:
+            message = viewer.closed_reason or "This package has expired. Secrets were closed."
+            viewer.wipe_secrets()
             if delete_on_expiry:
                 _delete_exact(path)
             _chrome(stdscr, title, "Closed")
-            _addstr(stdscr, 4, 2, "This package has expired. Secrets were closed.")
+            _addstr(stdscr, 4, 2, message)
+            if delete_on_expiry:
+                _addstr(stdscr, 6, 2, "The local package file was deleted (best effort; copies may remain).")
             stdscr.refresh()
             stdscr.timeout(-1)
             stdscr.getch()
@@ -173,6 +181,49 @@ def _run_viewer(stdscr, viewer: Viewer, path: Path, delete_on_expiry: bool) -> s
                 viewer.prev_row()
 
 
+def _confirm_host(stdscr, host: str) -> bool:
+    """The package names its release server. Ask before sending anything to it."""
+    _chrome(stdscr, "Release server", "Y Connect   N Cancel")
+    _addstr(stdscr, 4, 2, f"This package asks for its key from: {host}")
+    _addstr(stdscr, 6, 2, "Connect only if this is your Pastry server. A password proof is sent to it.")
+    stdscr.refresh()
+    while True:
+        key = stdscr.getch()
+        if key in (ord("y"), ord("Y")):
+            return True
+        if key in (ord("n"), ord("N"), KEY_ESC, ord("q"), ord("Q")):
+            return False
+
+
+def _poll_seconds() -> float:
+    """How often the viewer asks the release server whether the package is still active.
+    PASTRY_VIEWER_POLL_SECONDS is a test hook; the default is 30 seconds."""
+    try:
+        return max(0.5, float(os.environ.get("PASTRY_VIEWER_POLL_SECONDS", "30")))
+    except ValueError:
+        return 30.0
+
+
+def _server_open(stdscr, data: bytes, password: str, header, clear_seconds: float):
+    """Run the release protocol. Returns (viewer, transport) or (None, message)."""
+    capability = base64.urlsafe_b64encode(header.capability).rstrip(b"=").decode("ascii")
+    _chrome(stdscr, "Release server", "Please wait")
+    _addstr(stdscr, 4, 2, "Contacting the release server...")
+    stdscr.refresh()
+    try:
+        transport = release_client.HttpTransport(header.release_url)
+        release = release_client.open_server_package(data, password, transport)
+    except (release_client.ReleaseRefused, release_client.TransportError, package.PackageError) as exc:
+        return None, release_client.message_for(exc)
+    viewer = Viewer(
+        header=release.header, entries=release.entries, clear_after=clear_seconds,
+        server_expires_at=release.expires_at,
+        status_check=lambda: transport.status(capability)["state"],
+        poll_seconds=_poll_seconds(),
+    )
+    return viewer, None
+
+
 def _delete_exact(path: Path) -> None:
     """Delete only the file the user explicitly opened."""
     try:
@@ -208,6 +259,50 @@ def run(directory: str | None, open_path: Path | None, delete_on_expiry: bool, c
                 path = None
                 continue
             try:
+                header = package.inspect_package(data)
+            except package.PackageError as exc:
+                password = None
+                _chrome(stdscr, f"Opening {path.name}", "Press any key")
+                _addstr(stdscr, 4, 2, str(exc))
+                stdscr.getch()
+                if open_path is not None:
+                    return 1
+                path = None
+                continue
+            if header.is_server:
+                try:
+                    release_client.check_release_url(header.release_url)
+                except release_client.TransportError as exc:
+                    password = None
+                    _chrome(stdscr, header.name, "Press any key")
+                    _addstr(stdscr, 4, 2, str(exc))
+                    stdscr.getch()
+                    if open_path is not None:
+                        return 1
+                    path = None
+                    continue
+                if not _confirm_host(stdscr, header.release_url):
+                    password = None
+                    if open_path is not None:
+                        return 0
+                    path = None
+                    continue
+                viewer, problem = _server_open(stdscr, data, password, header, clear_seconds)
+                password = None
+                if viewer is None:
+                    _chrome(stdscr, header.name, "Press any key")
+                    _addstr(stdscr, 4, 2, problem)
+                    stdscr.getch()
+                    if open_path is not None:
+                        return 1
+                    path = None
+                    continue
+                outcome = _run_viewer(stdscr, viewer, path, delete_on_expiry)
+                if outcome == "quit" or open_path is not None:
+                    return 0
+                path = None
+                continue
+            try:
                 header, entries = package.open_package(data, password)
             except package.PackageError as exc:
                 password = None
@@ -219,7 +314,7 @@ def run(directory: str | None, open_path: Path | None, delete_on_expiry: bool, c
                 path = None
                 continue
             password = None
-            viewer = Viewer(header=header, entries=entries, clear_after=clear_seconds)
+            viewer = Viewer(header=header, entries=entries, clear_after=clear_seconds)  # offline package
             if viewer.expired():
                 if delete_on_expiry:
                     _delete_exact(path)

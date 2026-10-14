@@ -265,6 +265,7 @@ class ReleaseService:
                     "policy": row["policy"],
                     "state": state,
                     "created_at": _now_iso(row["created_at"]),
+                    "duration_seconds": row["duration_seconds"],
                     "expires_at": _now_iso(row["expires_at"]) if row["expires_at"] else None,
                     "redeemed": row["first_released_at"] is not None or state == "consumed",
                     "entry_count": row["entry_count"],
@@ -314,3 +315,19 @@ class ReleaseService:
                 erased += 1
             conn.execute("DELETE FROM release_nonces WHERE expires_at < ?", (now,))
         return erased
+
+
+def sweep_expired(store: Store, now: float) -> int:
+    """Erase release material of packages past their deadline. Needs no release key, so it is
+    safe to run at startup. Touches only the packages and release_nonces tables."""
+    erased = 0
+    with store.transaction() as conn:
+        rows = conn.execute(
+            "SELECT id FROM packages WHERE state = 'active' AND expires_at IS NOT NULL AND expires_at <= ?",
+            (now,)).fetchall()
+        for row in rows:
+            conn.execute("UPDATE packages SET state = 'expired', release_blob = NULL, auth_blob = NULL WHERE id = ?",
+                         (row["id"],))
+            erased += 1
+        conn.execute("DELETE FROM release_nonces WHERE expires_at < ?", (now,))
+    return erased
