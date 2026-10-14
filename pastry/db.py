@@ -13,7 +13,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 PACKAGE_STATEMENTS = (
     """
@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS entries (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     uid          TEXT NOT NULL UNIQUE,      -- random, used as AAD
     owner_id     INTEGER NOT NULL DEFAULT 0,  -- account that owns the entry (0 = the owner)
+    fmt          INTEGER NOT NULL DEFAULT 4,  -- 4: sealed under the account key; 5: under a per-entry key
+    key_blob     BLOB,                        -- fmt 5: entry key wrapped under the owner's account key
+    key_version  INTEGER NOT NULL DEFAULT 0,  -- increments when the entry key is rotated
     meta_blob    BLOB NOT NULL,             -- vault key: name, url, category, favourite, timestamps, lock info
     content_blob BLOB NOT NULL              -- vault key or entry key: username, password, notes, fields
 );
@@ -94,7 +97,37 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     blocked_until REAL NOT NULL DEFAULT 0
 );
 """
-SCHEMA = _BASE_SCHEMA + PACKAGE_SCHEMA + ";\n".join(ACCOUNT_STATEMENTS) + ";"
+# Entry sharing (schema v5). Public keys are plaintext but MAC-bound to the account id; private
+# keys are sealed under the account's vault key and only usable inside that account's session.
+SHARING_STATEMENTS = (
+    """
+CREATE TABLE IF NOT EXISTS account_keys (
+    account_id   INTEGER PRIMARY KEY,
+    public_key   BLOB NOT NULL,
+    public_mac   BLOB NOT NULL,                       -- HMAC(server binding key, account id, public key)
+    private_blob BLOB NOT NULL,                       -- AES-256-GCM under the account vault key
+    created_at   REAL NOT NULL
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS shares (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id     INTEGER NOT NULL,
+    owner_id     INTEGER NOT NULL,
+    recipient_id INTEGER NOT NULL,
+    can_edit     INTEGER NOT NULL DEFAULT 0 CHECK (can_edit IN (0, 1)),
+    can_export   INTEGER NOT NULL DEFAULT 0 CHECK (can_export IN (0, 1)),
+    envelope     BLOB NOT NULL,                       -- entry key wrapped to the recipient's public key
+    key_version  INTEGER NOT NULL,
+    created_at   REAL NOT NULL,
+    updated_at   REAL NOT NULL,
+    UNIQUE (entry_id, recipient_id)
+)
+""",
+)
+
+SCHEMA = (_BASE_SCHEMA + PACKAGE_SCHEMA + ";\n".join(ACCOUNT_STATEMENTS) + ";\n"
+          + ";\n".join(SHARING_STATEMENTS) + ";")
 
 
 class SchemaError(Exception):

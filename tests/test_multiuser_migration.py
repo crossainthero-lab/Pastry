@@ -67,7 +67,7 @@ def test_owner_login_migrates_automatically_and_keeps_everything(v3_home, clock)
     settings = v3_home["settings"]
     client = TestClient(_app(settings, clock), base_url=BASE_URL)
     assert login(client, "owner", V1_PASSWORD).status_code == 303
-    assert Store(settings.db_path).schema_version() == 4
+    assert Store(settings.db_path).schema_version() == 5
     names = sorted(e["name"] for e in client.get("/api/entries").json()["entries"])
     assert names == ["Locked Bank", "Plain Server"]
     locked = next(e for e in client.get("/api/entries").json()["entries"] if e["name"] == "Locked Bank")
@@ -108,7 +108,7 @@ def test_retry_after_an_interrupted_migration_succeeds(v3_home, clock, monkeypat
     assert login(TestClient(_app(settings, clock), base_url=BASE_URL), "owner", V1_PASSWORD).status_code == 503
     monkeypatch.undo()
     assert login(TestClient(_app(settings, clock), base_url=BASE_URL), "owner", V1_PASSWORD).status_code == 303
-    assert Store(settings.db_path).schema_version() == 4
+    assert Store(settings.db_path).schema_version() == 5
 
 
 def test_other_accounts_cannot_sign_in_before_the_owner_has_migrated(v3_home, clock):
@@ -166,3 +166,104 @@ def test_release_key_is_not_in_backups(v3_home, clock, tmp_path):
     import tarfile
     with tarfile.open(archive) as tar:
         assert "release.key" not in tar.getnames()
+
+
+# ----- entries upgraded to per-entry keys (schema v5) -----------------------------------------
+
+
+def _entry_formats(settings):
+    with sqlite3.connect(settings.db_path) as conn:
+        return [tuple(r) for r in conn.execute("SELECT id, fmt, key_version FROM entries ORDER BY id")]
+
+
+def test_legacy_entries_upgrade_to_entry_keys_at_signin_and_stay_readable(v3_home, clock):
+    settings = v3_home["settings"]
+    client = TestClient(_app(settings, clock), base_url=BASE_URL)
+    assert login(client, "owner", V1_PASSWORD).status_code == 303
+    assert all(fmt == 5 for _, fmt, _ in _entry_formats(settings))
+    entries = {e["name"]: e for e in client.get("/api/entries").json()["entries"]}
+    assert set(entries) == {"Plain Server", "Locked Bank"}
+    plain = client.get(f"/api/entries/{entries['Plain Server']['id']}").json()
+    assert plain["password"] == "v1-plain-pass-111" and plain["fields"][0]["value"] == "v1-ssh"
+    assert plain["created_at"] and plain["url"] == "https://example.com"
+    locked = entries["Locked Bank"]
+    assert locked["locked"] is True
+    unlocked = client.post(f"/api/entries/{locked['id']}/unlock", json={"password": V1_SEPARATE},
+                           headers=write_headers(client))
+    assert unlocked.json()["password"] == "v1-locked-pass"          # separate password still works
+    wrong = client.post(f"/api/entries/{locked['id']}/unlock", json={"password": "not the entry password"},
+                        headers=write_headers(client))
+    assert wrong.status_code == 403
+
+
+def test_upgraded_entries_keep_ids_and_can_be_shared(v3_home, clock):
+    settings = v3_home["settings"]
+    before_ids = [r[0] for r in sqlite3.connect(settings.db_path).execute("SELECT id FROM entries ORDER BY id")]
+    app = _app(settings, clock)
+    owner = TestClient(app, base_url=BASE_URL)
+    login(owner, "owner", V1_PASSWORD)
+    assert [r[0] for r in _entry_formats(settings)] == before_ids
+    token = invite(owner, "alice")
+    accept(app, token, ALICE_PW)
+    plain_id = next(e["id"] for e in owner.get("/api/entries").json()["entries"] if e["name"] == "Plain Server")
+    # A new account has no sharing key until its first sign-in, and the API says so.
+    early = owner.post(f"/api/entries/{plain_id}/shares", json={"username": "alice"}, headers=write_headers(owner))
+    assert early.status_code == 422 and "sign in once" in early.json()["detail"]
+    alice = TestClient(app, base_url=BASE_URL)
+    login(alice, "alice", ALICE_PW)
+    response = owner.post(f"/api/entries/{plain_id}/shares", json={"username": "alice"}, headers=write_headers(owner))
+    assert response.status_code == 201
+    assert alice.get(f"/api/shared/{plain_id}").json()["password"] == "v1-plain-pass-111"
+
+
+def test_interrupted_entry_upgrade_rolls_back_and_changes_nothing(v3_home, clock, monkeypatch):
+    settings = v3_home["settings"]
+    TestClient(_app(settings, clock), base_url=BASE_URL)
+    # Migrate the schema first, then fail the entry upgrade partway through.
+    from pastry import vault as vault_module
+    original = vault_module.Vault._upgrade_row
+    calls = {"n": 0}
+
+    def flaky(self, conn, row):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise sqlite3.OperationalError("simulated crash during entry upgrade")
+        return original(self, conn, row)
+
+    monkeypatch.setattr(vault_module.Vault, "_upgrade_row", flaky)
+    client = TestClient(_app(settings, clock), base_url=BASE_URL)
+    assert login(client, "owner", V1_PASSWORD).status_code == 303   # sign-in still works
+    assert all(fmt == 4 for _, fmt, _ in _entry_formats(settings))   # nothing was half-converted
+    names = sorted(e["name"] for e in client.get("/api/entries").json()["entries"])
+    assert names == ["Locked Bank", "Plain Server"]                 # legacy entries still readable
+    monkeypatch.undo()
+    again = TestClient(_app(settings, clock), base_url=BASE_URL)
+    assert login(again, "owner", V1_PASSWORD).status_code == 303
+    assert all(fmt == 5 for _, fmt, _ in _entry_formats(settings))
+
+
+def test_schema_v5_migration_failure_rolls_back_and_refuses_signin(v3_home, clock, monkeypatch):
+    settings = v3_home["settings"]
+    mig.migrate_v3_to_v4(Store(settings.db_path))
+    before = hashlib.sha256(settings.db_path.read_bytes()).hexdigest()
+    monkeypatch.setattr(mig, "SHARING_STATEMENTS", ("THIS IS NOT SQL",))
+    response = login(TestClient(_app(settings, clock), base_url=BASE_URL), "owner", V1_PASSWORD)
+    assert response.status_code == 503
+    with sqlite3.connect(settings.db_path) as conn:
+        columns = [r[1] for r in conn.execute("PRAGMA table_info(entries)")]
+    assert "fmt" not in columns
+    assert hashlib.sha256(settings.db_path.read_bytes()).hexdigest() == before
+    monkeypatch.undo()
+    assert login(TestClient(_app(settings, clock), base_url=BASE_URL), "owner", V1_PASSWORD).status_code == 303
+
+
+def test_separate_password_content_blob_is_byte_identical_across_the_upgrade(v3_home, clock):
+    settings = v3_home["settings"]
+    mig.migrate_v3_to_v4(Store(settings.db_path))
+    with sqlite3.connect(settings.db_path) as conn:
+        before = {r[0]: bytes(r[1]) for r in conn.execute("SELECT id, content_blob FROM entries")}
+    login(TestClient(_app(settings, clock), base_url=BASE_URL), "owner", V1_PASSWORD)
+    with sqlite3.connect(settings.db_path) as conn:
+        rows = conn.execute("SELECT id, content_blob FROM entries").fetchall()
+        locked_ids = [i for i, _ in rows if before[i] == bytes(dict(rows)[i])]
+    assert len(locked_ids) == 1   # exactly the protected entry was left untouched

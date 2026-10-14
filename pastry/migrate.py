@@ -17,7 +17,7 @@ import json
 from typing import Callable
 
 from . import crypto
-from .db import ACCOUNT_STATEMENTS, PACKAGE_STATEMENTS, SCHEMA_VERSION, Store
+from .db import ACCOUNT_STATEMENTS, PACKAGE_STATEMENTS, SCHEMA_VERSION, SHARING_STATEMENTS, Store
 from .vault import META_AAD_PREFIX
 
 V1_META_PREFIX = b"pastry:meta:"
@@ -156,6 +156,37 @@ def migrate_v3_to_v4(store: Store) -> dict:
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(SCHEMA_VERSION),),
+            ("4",)  # this step produces v4 exactly,
         )
     return {"entries": entries_after, "packages": packages_after}
+
+
+def migrate_v4_to_v5(store: Store) -> dict:
+    """Additive, no password needed: per-entry key columns, account key pairs and shares tables.
+
+    Existing entries stay in format 4 (sealed under the account key) and keep working. Each account's
+    entries are upgraded to per-entry keys the next time that account signs in (see vault.upgrade_entries),
+    because only that account's session holds its vault key. One transaction, verified before commit.
+    """
+    if store.schema_version() != 4:
+        raise MigrationError("The database is not schema v4; nothing to migrate.")
+    with store.transaction() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        conn.execute("ALTER TABLE entries ADD COLUMN fmt INTEGER NOT NULL DEFAULT 4")
+        conn.execute("ALTER TABLE entries ADD COLUMN key_blob BLOB")
+        conn.execute("ALTER TABLE entries ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0")
+        for statement in SHARING_STATEMENTS:
+            conn.execute(statement)
+        after = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        if after != before:
+            raise MigrationError("verification failed: row counts changed")
+        if conn.execute("SELECT COUNT(*) FROM entries WHERE fmt != 4").fetchone()[0]:
+            raise MigrationError("verification failed: entry format")
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise MigrationError("verification failed: integrity check")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+    return {"entries": after}

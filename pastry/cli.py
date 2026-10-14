@@ -19,7 +19,7 @@ from .backup import BackupError, create_backup, restore_backup, verify_backup
 from .config import Settings, load_settings
 from .db import SchemaError, Store
 from .db import SCHEMA_VERSION
-from .migrate import MigrationError, migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4
+from .migrate import MigrationError, migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5
 
 
 @dataclass
@@ -213,7 +213,7 @@ def cmd_migrate(_args: argparse.Namespace, ctx: Context) -> int:
     if version == SCHEMA_VERSION:
         print(f"The vault is already on schema v{SCHEMA_VERSION}. Nothing to do.")
         return 0
-    if version not in (1, 2, 3):
+    if version not in (1, 2, 3, 4):
         raise CliError(f"Unknown schema version {version}; refusing to migrate.")
     # Every step that rewrites data is preceded by a verified backup.
     print(f"Migrating schema v{version} -> v{SCHEMA_VERSION}. Stop the server first (systemctl stop pastry).")
@@ -233,13 +233,15 @@ def cmd_migrate(_args: argparse.Namespace, ctx: Context) -> int:
             print(f"Migrated {count} entries to schema v2.")
         if version in (1, 2):
             migrate_v2_to_v3(store)
-        info = migrate_v3_to_v4(store)
+        if version <= 3:
+            migrate_v3_to_v4(store)
+        info = migrate_v4_to_v5(store)
     except (MigrationError, BackupError, sqlite3.Error) as exc:
         raise CliError(f"Migration failed and was rolled back; the database is unchanged. ({exc})") from exc
     finally:
         crypto.wipe(dek)
-    print(f"Migrated to schema v{SCHEMA_VERSION}: {info['entries']} entries and {info['packages']} package records "
-          "kept. Separate-password locks were preserved.")
+    print(f"Migrated to schema v{SCHEMA_VERSION}: {info['entries']} entries kept. Each account's entries are "
+          "upgraded to per-entry keys at that account's next sign-in. Separate-password locks were preserved.")
     return 0
 
 
@@ -284,8 +286,8 @@ def _accounts_store(ctx: Context) -> Store:
     store = Store(ctx.settings.db_path)
     if not store.exists():
         raise CliError("No vault database found. Run: pastry setup")
-    if store.schema_version() != 4:
-        raise CliError("The vault database must be on schema v4. Run: pastry migrate")
+    if store.schema_version() != SCHEMA_VERSION:
+        raise CliError(f"The vault database must be on schema v{SCHEMA_VERSION}. Run: pastry migrate")
     return store
 
 

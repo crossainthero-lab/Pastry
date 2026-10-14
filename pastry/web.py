@@ -29,10 +29,10 @@ from . import crypto, package
 from .auth import AuthFile
 from .config import Settings
 from .db import SCHEMA_VERSION, Store
-from . import accounts
+from . import account_keys, accounts, sharing_crypto
 from . import release as releasemod
 from .backup import BackupError, create_backup, verify_backup
-from .migrate import MigrationError, migrate_v3_to_v4
+from .migrate import MigrationError, migrate_v3_to_v4, migrate_v4_to_v5
 from .package import AFTER_OPEN_SECONDS, MAX_ABSOLUTE_SECONDS
 from .ratelimit import SqlRateLimiter
 from .release import ReleaseError, ReleaseService
@@ -72,6 +72,7 @@ ERROR_STATUS = {
     "bad_passphrase": 400,
     "invalid": 422,
     "corrupt": 500,
+    "forbidden": 403,
 }
 
 
@@ -181,6 +182,17 @@ class InviteIn(BaseModel):
     username: str = Field(min_length=1, max_length=64)
 
 
+class ShareIn(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    can_edit: bool = False
+    can_export: bool = False
+
+
+class SharePermIn(BaseModel):
+    can_edit: bool = False
+    can_export: bool = False
+
+
 class PackageCreateIn(BaseModel):
     entry_ids: list[int] = Field(min_length=1, max_length=200)
     name: str = Field(min_length=1, max_length=100)
@@ -288,7 +300,12 @@ class AppContext:
         return self.settings.entry_idle_minutes * 60
 
     def vault(self, session: Session) -> Vault:
-        return Vault(self.store, session.dek, self.settings.kdf, session.account_id)
+        return Vault(self.store, session.dek, self.settings.kdf, session.account_id, session.priv)
+
+    def binding_key(self) -> bytes:
+        """Server-side key that binds public sharing keys to account ids. Derived from release.key."""
+        kek = releasemod.load_or_create_kek(self.settings.release_key_path)
+        return sharing_crypto.binding_key(kek)
 
     def account_epoch(self, account_id: int) -> int | None:
         """The current session epoch of an account, or None if it is missing, disabled or the owner's
@@ -459,6 +476,17 @@ def create_app(
         notice = notices.get(reason, "")
         return _login_page(request, 200, notice=notice)
 
+    def _prepare_sharing(session: Session) -> None:
+        """After sign-in: upgrade this account's legacy entries to per-entry keys and load its key pair.
+        A failure is logged and does not block sign-in; legacy entries keep working and sharing is
+        unavailable for the session."""
+        try:
+            Vault(ctx.store, session.dek, settings.kdf, session.account_id).upgrade_entries()
+            session.priv = account_keys.ensure_keys(ctx.store, session.account_id, session.dek,
+                                                    ctx.binding_key(), ctx.wall_clock())
+        except Exception as exc:  # noqa: BLE001 - must never block sign-in or leak details
+            log.error("sharing setup failed for account %s: %s", session.account_id, type(exc).__name__)
+
     @app.post("/login", response_class=HTMLResponse)
     def login(
         request: Request,
@@ -468,7 +496,7 @@ def create_app(
         if not _same_origin(request, ctx):
             return _login_page(request, 403, error="Request refused.")
         version = ctx.store.schema_version() if ctx.settings.db_path.exists() else 0
-        if version not in (3, 4):
+        if version not in (3, 4, SCHEMA_VERSION):
             return _login_page(request, 503, error="The vault database is not compatible. Run: pastry migrate")
         username = username.strip()
         ip_key = f"login-ip:{_client_ip(request)}"
@@ -488,12 +516,14 @@ def create_app(
         account_id, role, epoch, dek = None, None, None, None
         if is_owner:
             dek = authmod.try_unlock(auth, password)
-            if dek is not None and version == 3:
+            if dek is not None and version < SCHEMA_VERSION:
                 # First owner sign-in after an upgrade: backup, verify, then migrate (no decryption needed).
                 try:
                     backup = create_backup(settings, settings.backup_dir)
                     verify_backup(settings, backup)
-                    migrate_v3_to_v4(ctx.store)
+                    if version == 3:
+                        migrate_v3_to_v4(ctx.store)
+                    migrate_v4_to_v5(ctx.store)
                 except (BackupError, MigrationError, sqlite3.Error) as exc:
                     crypto.wipe(dek)
                     log.error("automatic migration refused: %s", exc)
@@ -501,7 +531,7 @@ def create_app(
                 ctx._schema_ok = True
             if dek is not None:
                 account_id, role, epoch = 0, "owner", auth.session_epoch
-        elif version == 4:
+        elif version == SCHEMA_VERSION:
             opened = accounts.open_login(ctx.store, username, password)
             if opened is not None:
                 account, dek = opened
@@ -519,8 +549,9 @@ def create_app(
 
         ctx.login_limiter.reset(ip_key)
         ctx.login_limiter.reset(user_key)
-        token, _ = ctx.sessions.create(username if role == "user" else auth.username, dek, epoch,
-                                       account_id=account_id, role=role)
+        token, new_session = ctx.sessions.create(username if role == "user" else auth.username, dek, epoch,
+                                                 account_id=account_id, role=role)
+        _prepare_sharing(new_session)
         response = RedirectResponse("/", status_code=303)
         response.set_cookie(ctx.cookie_name, token, httponly=True, secure=settings.cookie_secure,
                             samesite="strict", path="/")
@@ -653,12 +684,134 @@ def create_app(
                                                                        "done": False}, status_code=422)
         return templates.TemplateResponse(request, "invite.html", {"token": token, "error": "", "done": True})
 
-    # Entry sharing is deliberately disabled. See docs/MULTIUSER-CRYPTO.md section 7.
-    @app.api_route("/api/shares", methods=["GET", "POST", "PUT", "DELETE"])
-    @app.api_route("/api/shares/{share_id}", methods=["GET", "POST", "PUT", "DELETE"])
-    def sharing_disabled(share_id: str = ""):
-        raise HTTPException(501, "Entry sharing is not available in this version. "
-                                 "See docs/MULTIUSER-CRYPTO.md.")
+    # ----- entry sharing -----
+    # Authorisation is decided here on the server for every call:
+    #  - owner operations use the owner-scoped vault lookup, so another account's entry is "not found";
+    #  - recipient operations re-read the share row (and its key version) on every request, so a
+    #    revocation or rotation takes effect immediately and nothing is cached in the session.
+
+    def _account_name(account_id: int) -> str:
+        if account_id == accounts.OWNER_ID:
+            auth = ctx.auth.get()
+            return auth.username if auth else "owner"
+        account = accounts.get_account(ctx.store, account_id)
+        return account.username if account else "(removed account)"
+
+    def _resolve_recipient(username: str) -> int:
+        auth = ctx.auth.get()
+        if username.strip().lower() == auth.username.lower():
+            return accounts.OWNER_ID
+        found = accounts.find_id(ctx.store, username.strip())
+        account = accounts.get_account(ctx.store, found) if found is not None else None
+        if account is None or account.disabled:
+            raise HTTPException(404, "No active account has that username.")
+        return account.id
+
+    def _verified_public(account_id: int) -> bytes:
+        try:
+            return account_keys.load_public(ctx.store, account_id, ctx.binding_key())
+        except account_keys.KeyBindingError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    def _remaining_publics(vault: Vault, entry_id: int, excluding: list[int] | None) -> dict[int, bytes]:
+        return {rid: _verified_public(rid) for rid in vault.remaining_recipients(entry_id, excluding)}
+
+    @app.get("/api/directory")
+    def directory(session: Session = Depends(require_session)):
+        """Active account names, so an owner can choose a recipient. No keys or entries are listed."""
+        auth = ctx.auth.get()
+        listing = [{"username": a["username"], "role": a["role"]}
+                   for a in accounts.list_accounts(ctx.store, auth.username)
+                   if not a["disabled"] and a["id"] != session.account_id]
+        return {"accounts": listing}
+
+    @app.get("/api/entries/{entry_id}/shares")
+    def entry_access(entry_id: int, session: Session = Depends(require_session)):
+        vault = ctx.vault(session)
+        out = []
+        for grant in vault.list_access(entry_id):
+            rid = grant["recipient_id"]
+            out.append({**grant, "username": _account_name(rid),
+                        "fingerprint": account_keys.fingerprint_of(ctx.store, rid)})
+        return {"access": out, "own_fingerprint": account_keys.fingerprint_of(ctx.store, session.account_id)}
+
+    @app.post("/api/entries/{entry_id}/shares", status_code=201)
+    def share_entry(entry_id: int, body: ShareIn, session: Session = Depends(require_write)):
+        recipient_id = _resolve_recipient(body.username)
+        if recipient_id == session.account_id:
+            raise HTTPException(422, "You cannot share an entry with yourself.")
+        public = _verified_public(recipient_id)
+        ctx.vault(session).share(entry_id, recipient_id, public, body.can_edit, body.can_export, ctx.wall_clock())
+        return {"username": _account_name(recipient_id), "can_edit": body.can_edit, "can_export": body.can_export}
+
+    @app.put("/api/entries/{entry_id}/shares/{recipient_id}", status_code=204)
+    def change_share(entry_id: int, recipient_id: int, body: SharePermIn, session: Session = Depends(require_write)):
+        ctx.vault(session).update_share(entry_id, recipient_id, body.can_edit, body.can_export, ctx.wall_clock())
+        return Response(status_code=204)
+
+    @app.delete("/api/entries/{entry_id}/shares/{recipient_id}", status_code=204)
+    def revoke_share(entry_id: int, recipient_id: int, session: Session = Depends(require_write)):
+        vault = ctx.vault(session)
+        publics = _remaining_publics(vault, entry_id, [recipient_id])
+        vault.revoke(entry_id, [recipient_id], publics, ctx.wall_clock())
+        return Response(status_code=204)
+
+    @app.delete("/api/entries/{entry_id}/shares", status_code=204)
+    def revoke_all_shares(entry_id: int, session: Session = Depends(require_write)):
+        ctx.vault(session).revoke(entry_id, None, {}, ctx.wall_clock())
+        return Response(status_code=204)
+
+    @app.get("/api/shared")
+    def shared_with_me(session: Session = Depends(require_session)):
+        items = ctx.vault(session).list_shared(entry_keys(session))
+        for item in items:
+            item["owner"] = _account_name(item.pop("owner_id"))
+        return {"entries": items}
+
+    def _shared_detail(session: Session, entry_id: int) -> dict:
+        try:
+            item = ctx.vault(session).get_shared(entry_id, entry_keys(session, entry_id, touch=True))
+        except VaultError:
+            session.drop_key(entry_id)  # access ended: forget any separate-password key held for it
+            raise
+        item["owner"] = _account_name(item.pop("owner_id"))
+        return item
+
+    @app.get("/api/shared/{entry_id}")
+    def get_shared(entry_id: int, session: Session = Depends(require_session)):
+        return _shared_detail(session, entry_id)
+
+    @app.put("/api/shared/{entry_id}")
+    def edit_shared(entry_id: int, body: EntryIn, session: Session = Depends(require_write)):
+        try:
+            ctx.vault(session).update_shared(entry_id, _meta_of(body), _content_of(body),
+                                             entry_keys(session, entry_id, touch=True))
+        except VaultError as exc:
+            if exc.code == "not_found":
+                session.drop_key(entry_id)
+            raise
+        return {"ok": True}
+
+    @app.post("/api/shared/{entry_id}/unlock")
+    def unlock_shared(entry_id: int, body: PasswordIn, session: Session = Depends(require_write)):
+        limiter_key = f"entry:{entry_id}"
+        retry = ctx.entry_limiter.blocked_for(limiter_key)
+        if retry:
+            raise HTTPException(429, f"Too many attempts. Wait {retry} seconds and try again.")
+        try:
+            key, _content = ctx.vault(session).unlock_shared(entry_id, body.password)
+        except VaultError as exc:
+            if exc.code == "bad_password":
+                ctx.entry_limiter.record_failure(limiter_key)
+            raise
+        ctx.entry_limiter.reset(limiter_key)
+        session.put_key(entry_id, key, ctx.sessions.now())
+        return _shared_detail(session, entry_id)
+
+    @app.post("/api/shared/{entry_id}/lock", status_code=204)
+    def lock_shared(entry_id: int, session: Session = Depends(require_write)):
+        session.drop_key(entry_id)
+        return Response(status_code=204)
 
     @app.get("/api/settings")
     def get_settings(session: Session = Depends(require_session)):
@@ -779,16 +932,7 @@ def create_app(
                                      "which is not implemented in this version. Use an offline package.")
         now = datetime.now(timezone.utc)
         expires_at = now + timedelta(minutes=body.expires_in_minutes) if body.expires_in_minutes else None
-        vault = ctx.vault(session)
-        entries = []
-        for entry_id in dict.fromkeys(body.entry_ids):  # de-duplicate, keep order
-            item = vault.get(entry_id, entry_keys(session, entry_id, touch=True))
-            if item.get("locked") and "username" not in item:
-                raise VaultError("locked", f"Unlock \"{item['name']}\" before exporting it.")
-            entries.append({
-                "name": item["name"], "url": item["url"], "username": item["username"],
-                "password": item["password"], "notes": item["notes"], "fields": item["fields"],
-            })
+        entries = _gather_entries(session, body.entry_ids)
         try:
             data = package.build_package(entries, body.password, body.name, allow_copy=body.allow_copy,
                                          expires_at=expires_at, kdf=settings.kdf, now=now)
@@ -801,10 +945,18 @@ def create_app(
     # ----- server-enforced packages: owner API -----
 
     def _gather_entries(session: Session, entry_ids: list[int]) -> list[dict]:
+        """Entries to package. Owned entries are always allowed. A shared entry is allowed only with the
+        explicit export permission, and a protected one only after its separate password was entered."""
         vault = ctx.vault(session)
         entries = []
         for entry_id in dict.fromkeys(entry_ids):
-            item = vault.get(entry_id, entry_keys(session, entry_id, touch=True))
+            keys = entry_keys(session, entry_id, touch=True)
+            try:
+                item = vault.get(entry_id, keys)
+            except VaultError as exc:
+                if exc.code != "not_found":
+                    raise
+                item = vault.shared_export_item(entry_id, keys)  # raises forbidden or not_found
             if item.get("locked") and "username" not in item:
                 raise VaultError("locked", f"Unlock \"{item['name']}\" before exporting it.")
             entries.append({

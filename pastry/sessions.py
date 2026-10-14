@@ -32,6 +32,7 @@ class Session:
     sid: str = ""
     account_id: int = 0          # 0 is the owner; others are in the users table
     role: str = "owner"
+    priv: bytearray | None = None   # this account's X25519 private key, session memory only
     # Entry id -> (separate-password key, time it was last used).
     unlocked: dict[int, tuple[bytearray, float]] = field(default_factory=dict)
     lock: threading.RLock = field(default_factory=threading.RLock)
@@ -39,6 +40,7 @@ class Session:
     def wipe(self) -> None:
         with self.lock:
             wipe(self.dek)
+            wipe(self.priv)
             for key, _ in self.unlocked.values():
                 wipe(key)
             self.unlocked.clear()

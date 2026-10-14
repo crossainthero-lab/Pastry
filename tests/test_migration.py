@@ -108,7 +108,7 @@ def test_cli_migrate_creates_backup_first_and_verifies(v1_home, capsys):
     # The pre-migration backup is a valid v1 archive that can be restored if needed.
     report = verify_backup(v1_home, backups[0])
     assert report.schema_version == 1 and report.entry_count == 2
-    assert Store(v1_home.db_path).schema_version() == 4
+    assert Store(v1_home.db_path).schema_version() == 5
 
 
 def test_cli_migrate_with_wrong_password_changes_nothing(v1_home, capsys):

@@ -178,12 +178,6 @@ def test_owner_can_list_and_see_roles(world):
     assert roles == {USERNAME: "owner", "alice": "user", "bob": "user"}
 
 
-def test_sharing_endpoints_are_disabled_for_everyone(world):
-    for client in (world["owner"], world["alice"]):
-        assert client.get("/api/shares").status_code == 501
-        assert client.post("/api/shares/1", json={}, headers=write_headers(client)).status_code == 501
-
-
 # ----- invitations ---------------------------------------------------------------------
 
 
