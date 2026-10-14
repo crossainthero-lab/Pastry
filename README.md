@@ -43,7 +43,7 @@ Pastry/
 │   └── static/                app.css, app.js
 ├── SECURITY-REVIEW.md         threat model, crypto design, audit findings (v1.1)
 └── DEPLOYMENT.md              install, upgrade from v1.0, Tailscale, Caddy, systemd
-└── tests/                     pytest suite (252 tests), frozen v1 fixture in fixtures/v1
+└── tests/                     pytest suite (293 tests), frozen v1 fixture in fixtures/v1
 ```
 
 ---
@@ -507,3 +507,23 @@ Manual revocation is always available on the **Packages** page, and so is deleti
 Recipients run `pastry open FILE.pastry`. The viewer asks them to confirm the server host, then checks the server every 30 seconds and closes the secrets if the package expires, is revoked, or the server stops answering.
 
 **Important limits.** A recipient who has already opened a package may keep what they saw, and the key they were given. Revocation cannot undo that. Timed packages cannot be opened when the server is unreachable. See `SECURITY-REVIEW.md` section 12 and `docs/CRYPTOGRAPHY-V12.md` section 10. The design has had only a self-review.
+
+---
+
+## 14. Multi-user accounts (v1.2 branch)
+
+**Accounts.** The owner is created by `pastry setup` (it stays in `config/auth.json`). Other people get an account through an invitation:
+
+```bash
+.venv/bin/pastry admin create-user          # prompts for a username and prints an invitation link
+.venv/bin/pastry admin list-users           # accounts, status, pending invitations
+.venv/bin/pastry admin disable-user alice   # ends alice's sessions; her encrypted data is kept
+```
+
+The invitation works once and expires after 72 hours. The invitee opens the link, chooses their own master password, and signs in. The owner never sees that password. In the web interface, the **Users** page (owner only) does the same.
+
+**What each account can and cannot do.** Each account has its own encrypted vault, and the owner cannot open another account's entries. Entry sharing is **not available** in this version: it is disabled rather than shipped in a bypassable form. See `docs/MULTIUSER-CRYPTO.md` section 7.
+
+**Upgrading an existing single-user vault.** The first owner sign-in after the upgrade takes a verified backup, then runs the migration. You can also run `.venv/bin/pastry migrate` yourself. Entries, separate passwords, packages and timed packages are all kept. Nothing is re-encrypted.
+
+**Passwords.** A user can change their own password. A forgotten master password cannot be recovered by the owner, and that vault stays unreadable. This is deliberate.

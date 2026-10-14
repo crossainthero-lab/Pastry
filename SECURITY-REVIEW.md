@@ -269,3 +269,40 @@ Browser check (headless Chrome, against the live scratch server): an after-openi
 2. A real Tailscale Serve test on the target machine, with a second device.
 3. Measurement on Raspberry Pi-class hardware.
 4. The Packages page and the release protocol still need a browser run against a Tailscale HTTPS address.
+
+---
+
+## 13. Multi-user accounts (v1.2 branch): implementation status and review
+
+**Review status: self-review only. Not independently reviewed.** The architecture is in `docs/MULTIUSER-CRYPTO.md`.
+
+### 13.1 Implemented
+
+- **Accounts.** The owner stays in `config/auth.json`. Other accounts are in the `users` table. Each has its own Argon2id salt, password verifier and random 256-bit vault key, wrapped under a KEK derived from that account's password. No account can derive another's key. The owner cannot decrypt another account's entries, and role checks on the server enforce this at the route level.
+- **Invitations.** Created by the owner, single-use, expire after 72 hours, and stored only as a SHA-256 hash. The invitee chooses their own master password. The server generates their vault key. Usernames are unique across the owner and all accounts, case-insensitively.
+- **CLI.** `pastry admin create-user` prints an invitation link. `pastry admin list-users` shows accounts and pending invitations. `pastry admin disable-user USERNAME` disables an account and ends its sessions. The owner cannot be disabled.
+- **Web.** A Users page for the owner. Invite and disable actions are owner-only on the server. A public invitation page. Users see Shared With Me, which states that sharing is off.
+- **Migration.** Schema v4 is additive and needs no password. It adds `entries.owner_id` (default 0, the owner), the `users` and `invitations` tables, and rewrites package ownership to account ID `"0"`. It runs in one transaction with verification before commit. The owner's first sign-in after an upgrade takes a verified backup and then migrates. `pastry migrate` does the same from the command line.
+- **Session isolation.** Each account has its own session epoch. A password change, or disabling, invalidates only that account's sessions. The owner's password change no longer signs out other accounts.
+- **Packages.** Scoped by account ID. A timed package made before the upgrade still releases afterwards (tested).
+
+### 13.2 Not implemented
+
+- **Entry sharing.** Disabled. Every sharing endpoint returns HTTP 501, and no Share button exists. The reasons are in `docs/MULTIUSER-CRYPTO.md` section 7: recipient key verification (fingerprints compared out of band) is not built, per-entry keys are not built, and revocation with key rotation is not built. Sharing needs all three before it can be enabled safely.
+- **Administrative password reset.** Not offered. A forgotten master password means that vault is lost. This is deliberate.
+- **Export of shared entries.** Not applicable while sharing is disabled.
+
+### 13.3 Verification
+
+- `tests/test_multiuser.py`: three accounts (owner, alice, bob) over HTTP. Covers vault separation, search, ID manipulation on every entry route, locked entries, exports, packages, role checks, the disabled sharing endpoints, invitations (single-use, expiry, unknown tokens, case-insensitive uniqueness, the hash-only token), disabling and its effect on sessions, password changes that keep entries, invalid key wrapping failing closed, generic login errors, session isolation and per-session CSRF.
+- `tests/test_multiuser_migration.py`: automatic owner migration at sign-in, backup written and verified first, an interrupted migration rolling back byte-for-byte and refusing sign-in, retry after failure, non-owner sign-in refused before migration, a timed package from before the upgrade still releasing, package ownership rewritten, backup and restore preserving accounts and their entries, and the release key excluded from backups.
+- `tests/test_admin_commands.py`: CLI commands.
+- Headless browser: an owner creates an invitation, the invitee opens it in a separate browser profile, sets a password and signs in, sees the sharing notice, and creates an entry. The owner does not see that entry, and disables the account. The invitee's next request sends them to sign-in.
+- The earlier browser passes still work.
+
+### 13.4 Limitations specific to this version
+
+- **Server-side decryption.** The server holds an account's key while that account's session is open. An operator with code access to the server can read any open vault and any password typed into it. This is not end-to-end encryption.
+- **Invitation links are bearer secrets.** Anyone who sees a link before its recipient can register that username until it is used or expires.
+- **Disabled accounts keep their data.** Their encrypted vaults stay on the server until someone removes the account, and no removal command exists yet.
+- **Owner recovery.** The owner's own password is recovered only from the backup and the password itself, as before.
