@@ -17,6 +17,7 @@ vault.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import shutil
@@ -33,6 +34,7 @@ from .crypto import wipe
 from .db import Store
 from .vault import Vault
 
+AUTH_INFO = b"pastry-backup-auth/v1"
 FORMAT_NAME = "pastry-backup"
 FORMAT_VERSION = 2
 DB_NAME = "pastry.db"
@@ -45,6 +47,26 @@ class BackupError(Exception):
     pass
 
 
+def _auth_key(settings: Settings) -> bytes | None:
+    """MAC key derived from config/release.key. Absent if this installation has never made one."""
+    path = settings.release_key_path
+    if not path.exists():
+        return None
+    raw = path.read_bytes()
+    if len(raw) != 32:
+        return None
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=AUTH_INFO).derive(raw)
+
+
+def _manifest_mac(key: bytes, manifest: dict) -> str:
+    body = {k: v for k, v in manifest.items() if k != "auth"}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(key, canonical, hashlib.sha256).hexdigest()
+
+
 @dataclass
 class VerifyReport:
     archive: str
@@ -52,6 +74,9 @@ class VerifyReport:
     schema_version: int
     entry_count: int
     checksums: str  # "verified" or "absent (version 1 archive)"
+    # "verified" (HMAC checked against this server's key), "not verifiable here" (MAC present, key absent),
+    # or "none" (no MAC: checksums detect corruption only and prove nothing about who made the archive).
+    authenticity: str = "none"
     integrity: str = "ok"
     username: str = ""
     decrypted_unlocked: int | None = None
@@ -98,6 +123,9 @@ def create_backup(settings: Settings, out_dir: Path) -> Path:
             "entry_count": entries,
             "sha256": {DB_NAME: _sha256(snapshot), AUTH_NAME: _sha256(auth_copy)},
         }
+        key = _auth_key(settings)
+        if key is not None:
+            manifest["auth"] = {"alg": "hmac-sha256", "mac": _manifest_mac(key, manifest)}
         manifest_path = work_path / MANIFEST_NAME
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
@@ -184,7 +212,17 @@ def verify_backup(settings: Settings, archive: Path, password: str | None = None
         if manifest is not None and manifest["entry_count"] != entries:
             raise BackupError("Entry count does not match the manifest.")
 
+        authenticity = "none"
+        if manifest is not None and isinstance(manifest.get("auth"), dict):
+            key = _auth_key(settings)
+            if key is None:
+                authenticity = "not verifiable here (no release key on this machine)"
+            elif hmac.compare_digest(_manifest_mac(key, manifest), str(manifest["auth"].get("mac", ""))):
+                authenticity = "verified"
+            else:
+                raise BackupError("Authenticity check failed: this archive was not produced by this server's key.")
         report = VerifyReport(
+            authenticity=authenticity,
             archive=str(archive),
             format_version=manifest["version"] if manifest else 1,
             schema_version=schema,
@@ -222,12 +260,15 @@ def verify_backup(settings: Settings, archive: Path, password: str | None = None
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def restore_backup(settings: Settings, archive: Path) -> dict:
+def restore_backup(settings: Settings, archive: Path, require_authentic: bool = False) -> dict:
     """Verify the archive, then replace the current database and auth.json.
 
     Previous files are kept as *.before-restore-<stamp>. Stop the server first.
     """
     report = verify_backup(settings, archive)  # refuses corrupted or foreign archives
+    if require_authentic and report.authenticity != "verified":
+        raise BackupError("Refusing to restore: the archive's authenticity could not be verified "
+                          f"({report.authenticity}).")
     staging = Path(tempfile.mkdtemp(prefix="restore-", dir=settings.home))
     try:
         os.chmod(staging, 0o700)
@@ -247,6 +288,6 @@ def restore_backup(settings: Settings, archive: Path) -> dict:
         if restored.username != report.username:
             raise BackupError("Restored account does not match the verified archive.")
         return {"entries": report.entry_count, "archive": str(archive), "schema_version": report.schema_version,
-                "notes": report.notes}
+                "notes": report.notes, "authenticity": report.authenticity}
     finally:
         shutil.rmtree(staging, ignore_errors=True)

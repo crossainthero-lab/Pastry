@@ -23,7 +23,11 @@
     searchTimer: null,
     selected: new Set(),
     exportButton: null,
+    shared: false,   // true while viewing an entry someone shared with this account
   };
+
+  const entryApi = (id) => `${state.shared ? "/api/shared" : "/api/entries"}/${id}`;
+  const entryHash = (id) => `#/${state.shared ? "shared" : "entry"}/${id}`;
 
   // ----- DOM helper -------------------------------------------------------
 
@@ -232,7 +236,8 @@
 
   async function route() {
     const [head, arg, sub] = currentRoute();
-    const nextEntry = head === "entry" ? Number(arg) : null;
+    const nextEntry = head === "entry" || (head === "shared" && arg) ? Number(arg) : null;
+    state.shared = head === "shared";
     if (state.openEntryId !== null && state.openEntryId !== nextEntry) {
       const previous = state.openEntryId;
       state.openEntryId = null;
@@ -257,11 +262,11 @@
         state.listSpec = null;
         await refreshCategories();
         await showEditor(null);
-      } else if (head === "entry" && sub === "edit") {
+      } else if ((head === "entry" || (head === "shared" && arg)) && sub === "edit") {
         state.listSpec = null;
         await refreshCategories();
         await showEditor(nextEntry);
-      } else if (head === "entry") {
+      } else if (head === "entry" || (head === "shared" && arg)) {
         state.listSpec = null;
         await refreshCategories();
         await showDetail(nextEntry);
@@ -280,7 +285,7 @@
       } else if (head === "shared") {
         state.listSpec = null;
         await refreshCategories();
-        showShared();
+        await showSharedList();
       } else {
         location.hash = "#/";
       }
@@ -450,7 +455,7 @@
           submit.disabled = true;
           errorEl.hidden = true;
           try {
-            await api.post(`/api/entries/${entry.id}/unlock`, { password: input.value });
+            await api.post(`${entryApi(entry.id)}/unlock`, { password: input.value });
             await showDetail(entry.id);
           } catch (err) {
             if (err.status === 401) return;
@@ -511,13 +516,22 @@
   }
 
   async function showDetail(id) {
-    const entry = await api.get(`/api/entries/${id}`);
+    const entry = await api.get(entryApi(id));
     const locked = entry.locked && !entry.unlocked;
+    const shared = Boolean(entry.shared);
     const actions = [];
-    if (!locked) actions.push(h("a", { class: "btn", href: `#/entry/${id}/edit`, text: "Edit" }));
-    actions.push(h("button", { class: "btn", type: "button", text: "Export as Pastry", disabled: locked, onclick: () => openExport([id]) }));
-    actions.push(h("button", { class: "btn danger", type: "button", text: "Delete", onclick: () => deleteEntry(entry) }));
-    if (entry.locked && entry.unlocked) {
+    if (!locked && (!shared || entry.can_edit)) actions.push(h("a", { class: "btn", href: `${entryHash(id)}/edit`, text: "Edit" }));
+    if (!shared || entry.can_export) {
+      actions.push(h("button", { class: "btn", type: "button", text: "Export as Pastry", disabled: locked, onclick: () => openExport([id]) }));
+    }
+    if (!shared) {
+      actions.push(h("button", { class: "btn", type: "button", text: "Share", onclick: () => openShare(entry) }));
+      actions.push(h("button", { class: "btn danger", type: "button", text: "Delete", onclick: () => deleteEntry(entry) }));
+    }
+    if (shared && entry.locked && entry.unlocked) {
+      actions.push(h("button", { class: "btn", type: "button", text: "Lock now", onclick: () => relock(entry.id) }));
+    }
+    if (!shared && entry.locked && entry.unlocked) {
       actions.push(
         h("button", { class: "btn", type: "button", text: "Lock now", onclick: () => relock(entry.id) }),
         h("button", { class: "btn", type: "button", text: "Change separate password", onclick: () => changeSeparate(entry.id) }),
@@ -535,6 +549,8 @@
         h("h1", { text: entry.name }),
       ),
       entry.category ? h("div", { class: "muted small", text: entry.category }) : null,
+      shared ? h("div", { class: "muted small", text: `Shared by ${entry.owner} \u00b7 ${permissionLabel(entry)}` }) : null,
+      !shared && entry.shared_with ? h("div", { class: "muted small", text: `Shared with ${entry.shared_with} account(s)` }) : null,
       h("div", { class: "detail-actions" }, actions),
     );
 
@@ -897,14 +913,168 @@
     }
   }
 
-  function showShared() {
+  // ----- Share and Manage Access ---------------------------------------------------
+
+  function permissionLabel(p) {
+    if (p.can_edit && p.can_export) return "View, edit and export";
+    if (p.can_edit) return "View and edit";
+    if (p.can_export) return "View and export";
+    return "View only";
+  }
+
+  async function openShare(entry) {
+    let directory = [];
+    try {
+      directory = (await api.get("/api/directory")).accounts;
+    } catch (err) {
+      if (err.status === 401) return;
+      return toast(err.message);
+    }
+    const dlg = h("dialog", { "aria-labelledby": "share-title" });
+    const body = h("div", { class: "dialog-body export-body" });
+    dlg.append(body);
+
+    async function render() {
+      let data;
+      try {
+        data = await api.get(`/api/entries/${entry.id}/shares`);
+      } catch (err) {
+        if (err.status === 401) return;
+        body.replaceChildren(h("p", { class: "error", text: err.message }));
+        return;
+      }
+      const granted = new Set(data.access.map((a) => a.username));
+      const options = directory.filter((a) => !granted.has(a.username));
+      const select = h("select", { "aria-label": "Account to share with" },
+        options.length ? options.map((a) => h("option", { value: a.username, text: a.username }))
+          : [h("option", { value: "", text: "Every other account already has access", disabled: true })]);
+      const edit = h("input", { type: "checkbox" });
+      const exportBox = h("input", { type: "checkbox" });
+      const error = h("p", { class: "error", role: "alert", hidden: true });
+
+      const addButton = h("button", {
+        class: "btn primary", type: "button", text: "Share", disabled: options.length === 0,
+        onclick: async () => {
+          error.hidden = true;
+          try {
+            await api.post(`/api/entries/${entry.id}/shares`, {
+              username: select.value, can_edit: edit.checked, can_export: exportBox.checked,
+            });
+            toast(`Shared with ${select.value}`);
+            await render();
+          } catch (err) {
+            error.textContent = err.message;
+            error.hidden = false;
+          }
+        },
+      });
+
+      const rows = data.access.map((a) => h(
+        "div",
+        { class: "kv pkg" },
+        h("div", { class: "k" }, h("div", { text: a.username }),
+          h("div", { class: "small muted mono", text: a.fingerprint ? `Key ${a.fingerprint}` : "No key yet" })),
+        h("div", { class: "v plain", text: permissionLabel(a) }),
+        h("div", { class: "actions wrap" },
+          h("button", { class: "btn small", type: "button", text: a.can_edit ? "Make view-only" : "Allow edit",
+            onclick: () => changePermission(a, { can_edit: !a.can_edit, can_export: a.can_export }) }),
+          h("button", { class: "btn small", type: "button", text: a.can_export ? "Stop export" : "Allow export",
+            onclick: () => changePermission(a, { can_edit: a.can_edit, can_export: !a.can_export }) }),
+          h("button", { class: "btn small danger", type: "button", text: "Revoke", onclick: () => revoke(a) })),
+      ));
+
+      async function changePermission(a, perms) {
+        try {
+          await api.put(`/api/entries/${entry.id}/shares/${a.recipient_id}`, perms);
+          await render();
+        } catch (err) {
+          toast(err.message);
+        }
+      }
+
+      async function revoke(a) {
+        const ok = await dialog({
+          title: `Revoke ${a.username}'s access?`,
+          message: "Future requests from them are refused and the entry's key is replaced for everyone who keeps access. "
+            + "Anything they already viewed or copied cannot be taken back.",
+          confirmLabel: "Revoke",
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          await api.del(`/api/entries/${entry.id}/shares/${a.recipient_id}`);
+          toast("Access revoked");
+          await render();
+        } catch (err) {
+          toast(err.message);
+        }
+      }
+
+      async function revokeAll() {
+        const ok = await dialog({
+          title: "Revoke everyone?",
+          message: "Nobody else will be able to open this entry. Anything already viewed or copied cannot be taken back.",
+          confirmLabel: "Revoke all",
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          await api.del(`/api/entries/${entry.id}/shares`);
+          toast("All access revoked");
+          await render();
+        } catch (err) {
+          toast(err.message);
+        }
+      }
+
+      body.replaceChildren(
+        h("h2", { id: "share-title", text: `Share "${entry.name}"` }),
+        h("p", { text: "Choose an account. They receive access to this one entry only, never your vault or your password. Protected entries still need their separate password." }),
+        h("label", { class: "field" }, h("span", { text: "Account" }), select),
+        h("fieldset", { class: "choice" }, h("legend", { text: "Permissions" }),
+          h("label", {}, h("input", { type: "checkbox", checked: true, disabled: true }), "View and copy (always)"),
+          h("label", {}, edit, "Edit credential fields"),
+          h("label", {}, exportBox, "Allow export as .pastry")),
+        error,
+        h("div", { class: "dialog-actions" }, addButton),
+        h("h2", { text: "Who has access" }),
+        data.access.length ? h("div", { class: "panel" }, h("div", { class: "panel-body" }, rows))
+          : h("p", { class: "muted", text: "Nobody else can open this entry." }),
+        data.own_fingerprint ? h("p", { class: "small muted mono", text: `Your key: ${data.own_fingerprint}` }) : null,
+        h("p", { class: "help", text: "Key fingerprints let you confirm out of band that the right key is used. The server you are connected to can still read unlocked entries." }),
+        h("div", { class: "dialog-actions" },
+          data.access.length ? h("button", { class: "btn danger", type: "button", text: "Revoke everyone", onclick: revokeAll }) : null,
+          h("button", { class: "btn", type: "button", text: "Close", onclick: () => dlg.close() })),
+      );
+    }
+
+    dlg.addEventListener("close", () => { dlg.remove(); if (currentRoute()[0] === "entry") route(); });
+    document.body.append(dlg);
+    dlg.showModal();
+    await render();
+  }
+
+  // ----- Shared With Me ------------------------------------------------------------
+
+  async function showSharedList() {
+    const data = await api.get("/api/shared");
+    const rows = data.entries.map((e) => h(
+      "div",
+      { class: "entry-row shared-row" },
+      h("a", { class: "entry-main", href: `#/shared/${e.id}` },
+        h("div", {},
+          h("div", { class: "entry-title" }, h("span", { text: e.name })),
+          h("div", { class: "entry-sub", text: `Shared by ${e.owner}${e.category ? ` · ${e.category}` : ""}` })),
+        h("div", { class: "entry-meta" },
+          e.locked ? h("span", { class: "badge", text: e.unlocked ? "Unlocked" : "Separate password" }) : null,
+          h("span", { class: "badge", text: permissionLabel(e) }))),
+    ));
     view.replaceChildren(
-      h("div", { class: "view-head" }, h("h1", { text: "Shared With Me" })),
-      h("div", { class: "empty" },
-        h("h2", { text: "Entry sharing is not available yet" }),
-        h("p", { text: "Sharing one entry with another account needs recipient key verification and per-entry keys. Both are still in design, so sharing is switched off. Entries you create stay private to your account." }),
-        h("p", { class: "small muted", text: "See docs/MULTIUSER-CRYPTO.md in the project for the reasons." }),
-      ),
+      h("div", { class: "view-head" }, h("h1", { text: "Shared With Me" }),
+        h("span", { class: "muted small", text: `${data.entries.length} ${data.entries.length === 1 ? "entry" : "entries"}` })),
+      rows.length ? h("div", { class: "list" }, rows)
+        : h("div", { class: "empty" }, h("h2", { text: "Nothing shared with you yet" }),
+            h("p", { text: "Entries other accounts share with you appear here, with the access they gave you." })),
     );
   }
 
@@ -917,7 +1087,7 @@
   async function showEditor(id) {
     let entry = blankEntry();
     if (id !== null) {
-      entry = await api.get(`/api/entries/${id}`);
+      entry = await api.get(entryApi(id));
       if (entry.locked && !entry.unlocked) {
         view.replaceChildren(
           h(
@@ -928,7 +1098,7 @@
               "div",
               { class: "panel-body" },
               h("p", { class: "muted", text: "This entry has a separate password. Unlock it first, then edit it." }),
-              h("a", { class: "btn", href: `#/entry/${id}`, text: "Back to entry" }),
+              h("a", { class: "btn", href: entryHash(id), text: "Back to entry" }),
             ),
           ),
         );
@@ -1063,7 +1233,12 @@
     renderFields();
 
     // Separate password
-    const lockBox = h("input", { type: "checkbox", checked: wasLocked });
+    const lockBox = h("input", { type: "checkbox", checked: wasLocked, disabled: Boolean(entry.shared) });
+    if (entry.shared) {
+      // Category, favourite, protection and sharing stay with the owner; the server enforces this too.
+      categoryInput.disabled = true;
+      favouriteInput.disabled = true;
+    }
     const sepFirst = h("input", { type: "password", autocomplete: "new-password", maxlength: "256", "aria-label": "Separate password" });
     const sepSecond = h("input", { type: "password", autocomplete: "new-password", maxlength: "256", "aria-label": "Repeat separate password" });
     const sepBlock = h(
@@ -1080,7 +1255,8 @@
       ? "This entry is protected. Unchecking the box and saving removes the separate password."
       : "When enabled, this entry's contents are encrypted with a second password that the vault password cannot open.";
 
-    const cancelHref = id === null ? "#/" : `#/entry/${id}`;
+    const cancelHref = id === null ? "#/" : entryHash(id);
+    const sharedEdit = Boolean(entry.shared);
     const form = h(
       "form",
       { class: "editor", novalidate: true },
@@ -1170,11 +1346,11 @@
           toast(lockOn ? "Saved. Enter the separate password to view it." : "Entry saved");
           location.hash = `#/entry/${created.id}`;
         } else {
-          await api.put(`/api/entries/${id}`, payload);
-          if (lockOn && !wasLocked) await api.post(`/api/entries/${id}/protect/enable`, { password: sepFirst.value });
-          if (!lockOn && wasLocked) await api.post(`/api/entries/${id}/protect/remove`);
+          await api.put(entryApi(id), payload);
+          if (!sharedEdit && lockOn && !wasLocked) await api.post(`/api/entries/${id}/protect/enable`, { password: sepFirst.value });
+          if (!sharedEdit && !lockOn && wasLocked) await api.post(`/api/entries/${id}/protect/remove`);
           toast("Entry saved");
-          location.hash = `#/entry/${id}`;
+          location.hash = entryHash(id);
         }
       } catch (err) {
         if (err.status !== 401) fail(err.message);

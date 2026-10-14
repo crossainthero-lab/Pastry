@@ -534,3 +534,7 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
 /* ----- v1.2: accounts ----- */
 .invite-box { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; margin-top: 14px; }
 .invite-link { word-break: break-all; font-size: 0.85rem; }
+
+/* ----- v1.2: sharing ----- */
+.shared-row { grid-template-columns: 1fr; }
+dialog .kv.pkg { grid-template-columns: minmax(120px, 1fr) minmax(100px, 1fr) auto; }

@@ -191,6 +191,7 @@ def cmd_backup_verify(args: argparse.Namespace, ctx: Context) -> int:
     print(f"Archive          : {report.archive}")
     print(f"Format version   : {report.format_version}")
     print(f"Checksums        : {report.checksums}")
+    print(f"Authenticity     : {report.authenticity}")
     print(f"Integrity        : {report.integrity}")
     print(f"Schema version   : {report.schema_version}")
     print(f"Entries          : {report.entry_count}")
@@ -306,6 +307,32 @@ def cmd_list_users(_args: argparse.Namespace, ctx: Context) -> int:
     return 0
 
 
+def cmd_rebind_keys(_args: argparse.Namespace, ctx: Context) -> int:
+    """Re-bind every account's sharing public key to this machine's server secret.
+
+    Needed after restoring a backup onto a machine whose config/release.key differs. Sharing fails
+    closed until then. Compare the fingerprints with what each account shows in its share dialog."""
+    from . import account_keys, release, sharing_crypto
+
+    store = _accounts_store(ctx)
+    kek = release.load_or_create_kek(ctx.settings.release_key_path)
+    with store.connect() as conn:
+        rows = conn.execute("SELECT account_id, public_key FROM account_keys ORDER BY account_id").fetchall()
+    if not rows:
+        print("No sharing keys exist yet. Nothing to re-bind.")
+        return 0
+    print("Sharing keys that will be re-bound to this server's secret:")
+    for row in rows:
+        print(f"  account {row['account_id']:>3}  {sharing_crypto.fingerprint(bytes(row['public_key']))}")
+    answer = ctx.prompt_text("Type REBIND to confirm the fingerprints are the ones you expect: ").strip()
+    if answer != "REBIND":
+        print("Cancelled.")
+        return 1
+    done = account_keys.rebind_all(store, sharing_crypto.binding_key(kek))
+    print(f"Re-bound {len(done)} key(s).")
+    return 0
+
+
 def cmd_create_user(_args: argparse.Namespace, ctx: Context) -> int:
     from . import accounts
 
@@ -347,8 +374,10 @@ def cmd_restore(args: argparse.Namespace, ctx: Context) -> int:
         if answer != "RESTORE":
             print("Restore cancelled.")
             return 1
-    result = restore_backup(ctx.settings, archive)
-    print(f"Restored {result['entries']} entries from {archive.name}.")
+    result = restore_backup(ctx.settings, archive, require_authentic=args.require_authentic)
+    print(f"Restored {result['entries']} entries from {archive.name}. Authenticity: {result['authenticity']}.")
+    if result["authenticity"] != "verified":
+        print("Note: checksums only detect corruption. They do not prove who produced the archive.")
     print("Previous files were kept as *.before-restore-<timestamp>.")
     return 0
 
@@ -390,6 +419,8 @@ def build_parser() -> argparse.ArgumentParser:
     admin.add_parser("status", help="show configuration without secrets").set_defaults(func=cmd_status)
     admin.add_parser("list-users", help="list accounts and their status").set_defaults(func=cmd_list_users)
     admin.add_parser("create-user", help="create an invitation for a new account").set_defaults(func=cmd_create_user)
+    admin.add_parser("rebind-keys", help="re-bind sharing keys after restoring onto a new machine").set_defaults(
+        func=cmd_rebind_keys)
     disable = admin.add_parser("disable-user", help="disable an account and end its sessions")
     disable.add_argument("username")
     disable.set_defaults(func=cmd_disable_user)
@@ -406,6 +437,8 @@ def build_parser() -> argparse.ArgumentParser:
     restore = sub.add_parser("restore", help="restore from a backup archive")
     restore.add_argument("archive", help="path to a pastry-backup-*.tar.gz file")
     restore.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    restore.add_argument("--require-authentic", action="store_true",
+                         help="refuse archives whose HMAC cannot be verified with this server's key")
     restore.set_defaults(func=cmd_restore)
     return parser
 
