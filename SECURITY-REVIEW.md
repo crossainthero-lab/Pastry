@@ -343,6 +343,14 @@ The reviewer reported no authorization bypass, no envelope or key-derivation fla
 
 `pip-audit` reported 25 known vulnerabilities: `cryptography` 46.0.3 (7 advisories, fixed in 50.0.0) and `python-multipart` 0.0.20 (6 advisories, fixed in 0.0.31). Both are now pinned at `cryptography==50.0.2` and `python-multipart==0.0.32`, and `pyproject.toml` sets minimum versions at the first fixed releases. The audit now reports no known vulnerabilities, and CI repeats it on every pull request.
 
+### 14.3b Plaintext left in free pages after migration (found by running on a second SQLite build)
+
+Running the suite on a Python build with a different SQLite showed that, after a v1 to v2 migration, the old `entries` table's pages sat on SQLite's free list **with their plaintext timestamps and lock state intact**. Some builds zero freed pages and some do not, so the migration's promise to remove plaintext metadata held only on some machines. This was a real data-at-rest defect in the v1.1 migration, and it would also have left deleted rows' content in the file.
+
+**Fixed:** every connection now sets `PRAGMA secure_delete = ON`, and the v1 to v2 migration runs `VACUUM` after the table swap. The migration test that asserts no plaintext timestamps remain in the file now passes on Python 3.10, 3.12, 3.13 and 3.14.
+
+**Not covered:** a database file that was migrated by an earlier build may still contain plaintext in free pages. Run `sqlite3 data/pastry.db VACUUM` (with the server stopped) once to remove it, or use a fresh backup restore. Filesystem snapshots and previous backups taken before the migration are outside Pastry's control.
+
 ### 14.4 Cryptographic design of sharing
 
 See `docs/MULTIUSER-CRYPTO.md` section 7. In short: a random key per entry; the entry key is wrapped to each recipient's X25519 key (ephemeral-static agreement, HKDF-SHA256, AES-256-GCM) with the entry, owner, recipient and key version as authenticated context; public keys carry a MAC derived from a server secret; revocation re-keys the entry in one transaction.
@@ -351,7 +359,7 @@ See `docs/MULTIUSER-CRYPTO.md` section 7. In short: a random key per entry; the 
 
 ### 14.5 Tests
 
-- 344 passing, 0 failing, lint clean.
+- 344 passing, 0 failing, lint clean, on Python 3.10, 3.12, 3.13 and 3.14 (run locally with `uv`; GitHub Actions could not start because of an account billing limit, see 14.7).
 - Sharing: owner, alice and bob over HTTP routes. Permission boundaries, ID manipulation, key rotation with replayed old envelopes, tampered public keys, malformed envelopes, envelope move attempts, protected entries, concurrency, and the 12-step workflow including an exported package opened in the terminal viewer against a live server and expiry closing it.
 - Route inventory: every route that is not on a documented public list refuses anonymous callers, and every state-changing API route refuses a valid session without a CSRF token.
 - Migration: entry-format upgrade (IDs, owners, timestamps and separate-password content preserved, byte-identical for protected content), interrupted upgrade, interrupted schema migration, retry.
@@ -376,4 +384,4 @@ See `docs/MULTIUSER-CRYPTO.md` section 7. In short: a random key per entry; the 
 - Independent human security review of sharing, migration and package release.
 - Live Tailscale test with a second device.
 - Raspberry Pi performance measurement.
-- GitHub Actions run on the pushed branch (reported separately once it exists).
+- **GitHub Actions has not run.** Every job was refused with "recent account payments have failed or your spending limit needs to be increased". The workflow file is syntactically valid and the same steps were run locally (lint, the full suite on four Python versions, `pip-audit`, the tracked-file check, and `scripts/verify-wheel.sh`). The account's Billing settings need attention before CI can run.

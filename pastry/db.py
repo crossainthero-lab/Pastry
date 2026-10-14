@@ -187,6 +187,9 @@ class Store:
         conn = sqlite3.connect(self.path, isolation_level=None, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        # Overwrite deleted content with zeros. Some SQLite builds leave it in free pages, which would
+        # keep plaintext from migrated or deleted rows inside the database file.
+        conn.execute("PRAGMA secure_delete = ON")
         try:
             yield conn
         finally:

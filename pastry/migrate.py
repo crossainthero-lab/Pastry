@@ -101,6 +101,10 @@ def migrate_v1_to_v2(
             "CREATE TABLE IF NOT EXISTS rate_limits (key TEXT PRIMARY KEY, failures TEXT NOT NULL, "
             "blocked_until REAL NOT NULL DEFAULT 0)"
         )
+    # The old table's pages are now free. Rebuild the file so none of its plaintext (timestamps,
+    # lock state) remains anywhere in it, whatever the SQLite build does with freed pages.
+    with store.connect() as conn:
+        conn.execute("VACUUM")
     return len(rows)
 
 

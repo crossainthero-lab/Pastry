@@ -18,6 +18,7 @@ Not independently audited. See `SECURITY-REVIEW.md` section 14 for review status
 - Server dependencies are an optional `server` extra; the recipient viewer needs only `argon2-cffi` and `cryptography`.
 
 ### Security
+- Deleted and migrated rows no longer leave plaintext in SQLite free pages (`secure_delete` on every connection, `VACUUM` after the v1 to v2 table swap). Run `VACUUM` once on a database migrated by an earlier build.
 - Pinned `cryptography` 50.0.2 and `python-multipart` 0.0.32 after `pip-audit` reported 25 known vulnerabilities in the previous pins.
 - Stale cached separate-password keys can no longer corrupt an entry.
 - Revoking a recipient also drops their cached keys; protected entries warn that their separate password is unchanged.
