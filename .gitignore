@@ -1,0 +1,49 @@
+# Python and tooling
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local runtime data: never commit real vaults, keys or backups
+data/
+backups/
+restore-*/
+verify-*/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.before-restore-*
+*.part
+*.tar.gz
+*.pastry
+
+# Real configuration and secrets (examples stay tracked)
+config/*
+!config/*.example
+config/auth.json*
+config/pastry.json
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+
+# Logs, debug output, session/state
+*.log
+*.tmp
+*.swp
+.DS_Store
+
+# Synthetic test fixture: a v1 vault built with a test password, used by migration tests.
+# It contains no real credentials. Tracked on purpose.
+!tests/fixtures/v1/
+!tests/fixtures/v1/*.db
+!tests/fixtures/v1/auth.json

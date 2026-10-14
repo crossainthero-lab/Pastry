@@ -1,0 +1,9 @@
+# Direct LAN access over HTTPS (see README.md, section "Option B").
+# Replace pastry.lan with a name your devices resolve. Caddy issues a certificate
+# from its own private CA ("tls internal"); install that CA's root certificate on each
+# device you use, otherwise browsers will warn.
+pastry.lan {
+    tls internal
+    reverse_proxy 127.0.0.1:8787
+    header -Server
+}

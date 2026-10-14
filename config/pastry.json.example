@@ -1,0 +1,7 @@
+{
+  "session_timeout_minutes": 10,
+  "session_max_hours": 12,
+  "cookie_secure": true,
+  "allowed_hosts": ["127.0.0.1", "localhost"],
+  "allowed_origins": []
+}

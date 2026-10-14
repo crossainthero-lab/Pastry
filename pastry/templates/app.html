@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}Pastry{% endblock %}
+{% block bodyattrs %} data-csrf="{{ csrf }}"{% endblock %}
+{% block body %}
+<div class="shell" id="shell">
+  <header class="topbar">
+    <button class="icon-btn" id="menu-btn" type="button" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+    <span class="wordmark">Pastry</span>
+  </header>
+
+  <aside class="sidebar" id="sidebar">
+    <div class="wordmark">Pastry</div>
+    <nav class="nav" aria-label="Main">
+      <a href="#/" data-nav="all">All entries</a>
+      <a href="#/favourites" data-nav="favourites">Favourites</a>
+      <div class="nav-label">Categories</div>
+      <div id="category-list" class="category-list"></div>
+      <a href="#/settings" data-nav="settings">Settings</a>
+    </nav>
+    <div class="sidebar-foot">
+      <span class="muted small" title="Signed in as">{{ username }}</span>
+      <button class="link-btn" id="signout-btn" type="button">Lock and sign out</button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim" hidden></div>
+
+  <main class="main">
+    <div class="toolbar" id="toolbar">
+      <input type="search" id="search" class="search" placeholder="Search entries" aria-label="Search entries" autocomplete="off" maxlength="200">
+      <a class="btn primary" href="#/new">Add Entry</a>
+    </div>
+    <section id="view" class="view" aria-live="polite"></section>
+  </main>
+</div>
+<div class="toast" id="toast" role="status" hidden></div>
+<script src="/static/app.js"></script>
+{% endblock %}

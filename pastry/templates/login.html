@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Pastry{% endblock %}
+{% block body %}
+<main class="login-wrap">
+  <form class="login-card" method="post" action="/login" autocomplete="on">
+    <div class="wordmark large">Pastry</div>
+    <p class="muted">Sign in to your vault.</p>
+    {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <label class="field">
+      <span>Username</span>
+      <input name="username" type="text" autocomplete="username" required autofocus maxlength="200" value="{{ username }}">
+    </label>
+    <label class="field">
+      <span>Master password</span>
+      <input name="password" type="password" autocomplete="current-password" required maxlength="512">
+    </label>
+    <button class="btn primary block" type="submit">Sign in</button>
+  </form>
+</main>
+{% endblock %}

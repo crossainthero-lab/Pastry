@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pastry-password-server"
+version = "1.1.0"
+description = "Pastry: a small, self-hosted, encrypted password vault"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
+    "jinja2>=3.1,<4",
+    "python-multipart>=0.0.9",
+    "argon2-cffi>=23.1",
+    "cryptography>=42",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[project.scripts]
+pastry = "pastry.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+include = ["pastry*"]
+
+[tool.setuptools.package-data]
+pastry = ["templates/*.html", "static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
