@@ -306,3 +306,74 @@ Browser check (headless Chrome, against the live scratch server): an after-openi
 - **Invitation links are bearer secrets.** Anyone who sees a link before its recipient can register that username until it is used or expires.
 - **Disabled accounts keep their data.** Their encrypted vaults stay on the server until someone removes the account, and no removal command exists yet.
 - **Owner recovery.** The owner's own password is recovered only from the backup and the password itself, as before.
+
+---
+
+## 14. v1.2 release candidate: entry sharing, review process and release gates
+
+Version: `1.2.0rc1` (release candidate). **Not released, not merged, and not independently audited.**
+
+### 14.1 What was reviewed, and by whom
+
+| Review | What it is | What it is not |
+|---|---|---|
+| Self-review by the developer (an AI model) during implementation | Design checks, adversarial tests written by the same author, and a route inventory | Independent |
+| One adversarial review by a separate AI agent with no prior context, given the code and the threat model | A fresh read of `sharing_crypto.py`, `account_keys.py`, the sharing parts of `vault.py` and `web.py`, and the migrations. It reported seven findings and listed what it found sound. | A human cryptographer, a paid audit, or a formal verification |
+| `pip-audit` on the pinned runtime dependencies | Found 25 known vulnerabilities in two pins | A review of Pastry's own code |
+
+**An independent human security review has not happened. It is the remaining release gate.**
+
+### 14.2 Findings of the separate AI review, reconciled
+
+Each claim was checked against the code before action.
+
+| # | Severity | Finding | Verdict | Disposition |
+|---|---|---|---|---|
+| 1 | Medium | A stale separate-password key cached in a session could seal new content after the password was changed from another session, making the entry unreadable (data loss, or deliberate sabotage by an editor who knew the old password). | Confirmed | **Fixed.** The cached key must open the stored content inside the write transaction (409 otherwise) and is dropped. Regression tests fail without the fix. |
+| 2 | Medium/Low | Revoking a protected entry does not re-key its separate-password layer, so a revoked recipient who knew that password could still open any ciphertext copy they hold (for example a package export). | Confirmed; already stated in the design | **Mitigated, not eliminated.** The API now returns an explicit warning and the interface shows it. Changing the separate password re-keys the layer. A forced re-key at revocation was not implemented. |
+| 3 | Low | The unlock-attempt limiter was shared between an entry's owner and its recipients, so a recipient could lock the owner out, and a success by one account reset the other's counter. | Confirmed | **Fixed.** Limits are per account and entry, with a ceiling across accounts, and a success resets only that account's counter. |
+| 4 | Low | After a restore onto a machine with a different `release.key`, revoking a single recipient fails until keys are re-bound. | Confirmed; fail-closed by design | **Mitigated.** The error names `pastry admin rebind-keys` and the revoke-everyone fallback. |
+| 5 | Low | The directory endpoint and the "has not generated a sharing key" message let any signed-in account enumerate accounts and see whether they have signed in. | Confirmed | **Accepted** for a household or team deployment, and documented. No keys or entries are listed. |
+| 6 | Low | A cached separate-password key survived a revoke and re-share, giving instant access without re-entering the password. | Confirmed | **Fixed.** Revoking and sharing drop the recipient's cached key for the entry in every session. |
+| 7 | Low | Protection changes read the row outside the transaction, so a concurrent edit could be overwritten. | Confirmed | **Fixed.** Read, transform and write run in one transaction. |
+
+The reviewer reported no authorization bypass, no envelope or key-derivation flaw, and no data loss in the migration.
+
+### 14.3 Dependency vulnerabilities found and fixed
+
+`pip-audit` reported 25 known vulnerabilities: `cryptography` 46.0.3 (7 advisories, fixed in 50.0.0) and `python-multipart` 0.0.20 (6 advisories, fixed in 0.0.31). Both are now pinned at `cryptography==50.0.2` and `python-multipart==0.0.32`, and `pyproject.toml` sets minimum versions at the first fixed releases. The audit now reports no known vulnerabilities, and CI repeats it on every pull request.
+
+### 14.4 Cryptographic design of sharing
+
+See `docs/MULTIUSER-CRYPTO.md` section 7. In short: a random key per entry; the entry key is wrapped to each recipient's X25519 key (ephemeral-static agreement, HKDF-SHA256, AES-256-GCM) with the entry, owner, recipient and key version as authenticated context; public keys carry a MAC derived from a server secret; revocation re-keys the entry in one transaction.
+
+**Trust model.** Decryption is server-side. A malicious or compromised server can substitute public keys, wrap to its own, and read any unlocked entry. Pastry makes no end-to-end encryption claim and no malicious-server resistance claim.
+
+### 14.5 Tests
+
+- 344 passing, 0 failing, lint clean.
+- Sharing: owner, alice and bob over HTTP routes. Permission boundaries, ID manipulation, key rotation with replayed old envelopes, tampered public keys, malformed envelopes, envelope move attempts, protected entries, concurrency, and the 12-step workflow including an exported package opened in the terminal viewer against a live server and expiry closing it.
+- Route inventory: every route that is not on a documented public list refuses anonymous callers, and every state-changing API route refuses a valid session without a CSRF token.
+- Migration: entry-format upgrade (IDs, owners, timestamps and separate-password content preserved, byte-identical for protected content), interrupted upgrade, interrupted schema migration, retry.
+- Backups: shares and key envelopes preserved on restore, authenticity MAC, forged-checksum archives refused, restore without the release key.
+- Browser (headless Chrome): invitation and first sign-in, share, edit by the recipient, revocation, immediate refusal.
+
+### 14.6 Remaining risks and limitations
+
+1. **No independent human review.** The main release gate.
+2. **Server-side decryption.** Operators and compromised servers can read open vaults and substitute keys.
+3. **Revocation cannot recall** what a recipient already saw, copied or exported. Protected entries need their separate password changed to re-key that layer.
+4. **Public-key binding depends on `config/release.key`.** Losing it (or restoring elsewhere) makes sharing fail closed until keys are re-bound after comparing fingerprints.
+5. **Backup authenticity is relative to the same server secret.** It proves the archive came from a holder of that key, not from any particular person. Archives from machines without a release key carry no MAC, and checksums alone prove nothing about origin.
+6. **Account enumeration** among signed-in accounts (see finding 5).
+7. **Ownership is not transferable,** and a disabled account's data stays until removed (no removal command exists).
+8. **Timed packages** remain bypassable by anyone who already obtained a release key.
+9. **GitHub Actions** pin actions by major version tags, not by commit SHA.
+10. **The terminal viewer** cannot erase memory or terminal scrollback reliably.
+
+### 14.7 Release gates still open
+
+- Independent human security review of sharing, migration and package release.
+- Live Tailscale test with a second device.
+- Raspberry Pi performance measurement.
+- GitHub Actions run on the pushed branch (reported separately once it exists).

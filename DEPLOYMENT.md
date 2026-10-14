@@ -274,3 +274,67 @@ Timed packages need the recipient's viewer to reach this server while the packag
 - Upgrading from v2 needs `.venv/bin/pastry migrate` before the new server starts. The migration is additive and makes a backup first.
 
 **Not tested here:** the Tailscale steps above were not run, because no tailnet exists on the development machine.
+
+---
+
+## J. Upgrading to 1.2 (accounts and sharing)
+
+1. **Back up first, and keep a copy off the machine.**
+
+   ```bash
+   cd ~/Documents/pastry-password-server/Pastry
+   .venv/bin/pastry backup
+   .venv/bin/pastry backup verify backups/$(ls -t backups | head -1) --password-check
+   ```
+
+   `pastry backup verify` reports **Authenticity: verified** when the archive carries a MAC that this server's `config/release.key` confirms. Checksums alone only detect corruption.
+
+2. **Stop the service, update, reinstall.**
+
+   ```bash
+   sudo systemctl stop pastry
+   # update the code (git pull, or copy the new project over the old one; keep data/, config/ and backups/)
+   ./install.sh
+   ```
+
+3. **Migrate.** Either sign in as the owner (the first sign-in takes a verified backup, then migrates), or run:
+
+   ```bash
+   .venv/bin/pastry migrate
+   ```
+
+   The schema migration is one transaction and is verified before commit. A failure rolls back and leaves the database unchanged.
+
+4. **Start and check.**
+
+   ```bash
+   sudo systemctl start pastry
+   .venv/bin/pastry admin list-users
+   ```
+
+   Each account's older entries are converted to per-entry keys the next time that account signs in. The conversion is atomic per account, and a failure leaves the entries readable in the old format.
+
+**Rollback:** `sudo systemctl stop pastry`, then `.venv/bin/pastry restore backups/<archive> --require-authentic`, then reinstall the previous version.
+
+### Files that matter
+
+| File | Needed for | In backups? |
+|---|---|---|
+| `config/auth.json` | the owner's account and vault key | yes |
+| `data/pastry.db` | every account, entry, share and package record | yes |
+| `config/release.key` | timed-package release keys and sharing key binding, and backup authenticity | **no, on purpose** |
+| each person's master password | their vault | never stored |
+| each protected entry's separate password | that entry's content | never stored |
+
+**Back up `config/release.key` separately** (for example on an encrypted drive that is not next to the backups). Without it, after a restore on another machine:
+
+- timed packages cannot be released;
+- sharing fails closed until the owner runs `pastry admin rebind-keys` after comparing key fingerprints with each account's share dialog.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request with read-only permissions: lint, the full test suite on Python 3.10, 3.12 and 3.13 (with the migration, package-format and CLI suites called out), `pip-audit` on the pinned runtime dependencies, a check that no sensitive file names are tracked, and `scripts/verify-wheel.sh`, which builds the wheel and installs it into a clean environment with only the base dependencies. No secrets, databases or packages are used or uploaded.
+
+### Accounts and Tailscale
+
+All accounts use the same Tailscale address. Each account signs in with its own username and master password. Invitation links use the same address (`public_url` if set), and the server's `allowed_hosts` must include it.

@@ -178,3 +178,12 @@ Same envelope as offline packages (magic, version 1, length, header JSON), but:
 - A recipient who has obtained `K_r` can keep a copy of it, and the file, indefinitely. The server cannot prevent this, and the viewer cannot either. Expiry only stops future server releases.
 - Python and the operating system may keep copies of keys and plaintext in memory or swap. Best-effort clearing only.
 - The "one-time" guarantee is about server releases, not about what the recipient retains.
+
+---
+
+## 11. Interaction with entry sharing (1.2.0rc1)
+
+- A package is built from the entries the requester may see. Owned entries are always allowed. A shared entry is packaged only if its owner granted the **export** permission to that account, and a protected entry only after its separate password has been entered in that session.
+- The package carries decrypted content under the package's own keys. It is independent of the sharing envelopes, so revoking a share does not affect packages already created. Revoking a timed package is a separate action on the Packages page.
+- Server-enforced packages remain bound to the account that created them (`packages.owner` is the account ID).
+- Release keys and the sharing key-binding MAC both derive from `config/release.key`, which is excluded from backups.

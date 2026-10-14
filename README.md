@@ -43,7 +43,7 @@ Pastry/
 │   └── static/                app.css, app.js
 ├── SECURITY-REVIEW.md         threat model, crypto design, audit findings (v1.1)
 └── DEPLOYMENT.md              install, upgrade from v1.0, Tailscale, Caddy, systemd
-└── tests/                     pytest suite (293 tests), frozen v1 fixture in fixtures/v1
+└── tests/                     pytest suite (344 tests), frozen v1 fixture in fixtures/v1
 ```
 
 ---
@@ -510,9 +510,9 @@ Recipients run `pastry open FILE.pastry`. The viewer asks them to confirm the se
 
 ---
 
-## 14. Multi-user accounts (v1.2 branch)
+## 14. Multi-user accounts and entry sharing (1.2.0rc1)
 
-**Accounts.** The owner is created by `pastry setup` (it stays in `config/auth.json`). Other people get an account through an invitation:
+**Accounts.** The owner is created by `pastry setup`. Other people get an account through an invitation:
 
 ```bash
 .venv/bin/pastry admin create-user          # prompts for a username and prints an invitation link
@@ -520,10 +520,20 @@ Recipients run `pastry open FILE.pastry`. The viewer asks them to confirm the se
 .venv/bin/pastry admin disable-user alice   # ends alice's sessions; her encrypted data is kept
 ```
 
-The invitation works once and expires after 72 hours. The invitee opens the link, chooses their own master password, and signs in. The owner never sees that password. In the web interface, the **Users** page (owner only) does the same.
+An invitation works once and expires after 72 hours. The invitee chooses their own master password, and the owner never sees it. Each account has its own encrypted vault, and the owner cannot read another account's entries. A forgotten master password cannot be recovered by anyone.
 
-**What each account can and cannot do.** Each account has its own encrypted vault, and the owner cannot open another account's entries. Entry sharing is **not available** in this version: it is disabled rather than shipped in a bypassable form. See `docs/MULTIUSER-CRYPTO.md` section 7.
+**Sharing one entry.** Open an entry you own and press **Share**. Choose an account and permissions:
 
-**Upgrading an existing single-user vault.** The first owner sign-in after the upgrade takes a verified backup, then runs the migration. You can also run `.venv/bin/pastry migrate` yourself. Entries, separate passwords, packages and timed packages are all kept. Nothing is re-encrypted.
+- **View** (always): read and copy the credentials.
+- **Edit**: change the name, URL and credential content.
+- **Export**: package the entry as `.pastry`. Off unless granted.
 
-**Passwords.** A user can change their own password. A forgotten master password cannot be recovered by the owner, and that vault stays unreadable. This is deliberate.
+Only the entry's owner can share, change permissions or revoke. **Manage Access** is in the same dialog. The recipient finds the entry under **Shared With Me**. A recipient must have signed in once before they can receive a share.
+
+**Revoking.** Access ends on the recipient's next request, and the entry's key is replaced for everyone who keeps access. Anything the person already saw or copied cannot be recalled. An entry with a separate password stays protected by that password: if the person knew it, change it after revoking.
+
+**Protected entries.** Sharing never removes "Require Separate Password". A recipient needs the sharing grant and the separate password, which you give them yourself.
+
+**Upgrading.** The first owner sign-in after the upgrade takes a verified backup and migrates the database. Each account's older entries are converted to per-entry keys at that account's next sign-in. `pastry migrate` does the schema step from the command line.
+
+**Trust model.** Pastry decrypts on the server. It is not end-to-end encrypted, and a compromised server can read open vaults and substitute sharing keys. See `docs/MULTIUSER-CRYPTO.md` and `SECURITY-REVIEW.md` section 14.
