@@ -17,7 +17,7 @@ from . import crypto
 from .backup import BackupError, create_backup, restore_backup, verify_backup
 from .config import Settings, load_settings
 from .db import SchemaError, Store
-from .migrate import MigrationError, migrate_v1_to_v2
+from .migrate import MigrationError, migrate_v1_to_v2, migrate_v2_to_v3
 
 
 @dataclass
@@ -200,12 +200,22 @@ def cmd_migrate(_args: argparse.Namespace, ctx: Context) -> int:
     if not store.exists():
         raise CliError("No vault database found. Run: pastry setup")
     version = store.schema_version()
-    if version == 2:
-        print("The vault is already on schema v2. Nothing to do.")
+    if version == 3:
+        print("The vault is already on schema v3. Nothing to do.")
         return 0
-    if version != 1:
+    if version not in (1, 2):
         raise CliError(f"Unknown schema version {version}; refusing to migrate.")
-    print("Migrating schema v1 -> v2. Stop the server first (systemctl stop pastry).")
+    if version == 2:
+        # v2 -> v3 is additive (package tables) and needs no password.
+        try:
+            backup = create_backup(settings, settings.backup_dir)
+            print(f"Pre-migration backup written: {backup}")
+            migrate_v2_to_v3(store)
+        except (MigrationError, BackupError) as exc:
+            raise CliError(f"Migration failed and was rolled back; the database is unchanged. ({exc})") from exc
+        print("Migrated the vault to schema v3 (server-enforced package tables added).")
+        return 0
+    print("Migrating schema v1 -> v2 -> v3. Stop the server first (systemctl stop pastry).")
     password = ctx.prompt_password("Master password: ")
     auth = authmod.read_auth(settings.auth_path)
     dek = authmod.try_unlock(auth, password)
@@ -215,11 +225,12 @@ def cmd_migrate(_args: argparse.Namespace, ctx: Context) -> int:
         backup = create_backup(settings, settings.backup_dir)
         print(f"Pre-migration backup written: {backup}")
         count = migrate_v1_to_v2(store, dek)
+        migrate_v2_to_v3(store)
     except (MigrationError, BackupError) as exc:
         raise CliError(f"Migration failed and was rolled back; the database is unchanged. ({exc})") from exc
     finally:
         crypto.wipe(dek)
-    print(f"Migrated {count} entries to schema v2. Separate-password locks were preserved.")
+    print(f"Migrated {count} entries to schema v3. Separate-password locks were preserved.")
     return 0
 
 

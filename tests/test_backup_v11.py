@@ -53,7 +53,7 @@ def test_v2_archive_has_manifest_with_checksums(archive):
         manifest = json.loads(tar.extractfile("manifest.json").read())
     assert manifest["format"] == "pastry-backup"
     assert manifest["version"] == 2
-    assert manifest["schema_version"] == 2
+    assert manifest["schema_version"] == 3
     assert manifest["entry_count"] == 2
     assert set(manifest["sha256"]) == {"pastry.db", "auth.json"}
 
@@ -147,7 +147,7 @@ def test_restore_into_isolated_home_verifies_entries(populated, archive, tmp_pat
     isolated.home.mkdir()
     result = restore_backup(isolated, archive)
     assert result["entries"] == 2
-    assert result["schema_version"] == 2
+    assert result["schema_version"] == 3
     store = Store(isolated.db_path)
     assert store.entry_count() == 2
     import stat, os

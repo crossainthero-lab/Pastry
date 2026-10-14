@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 import hmac
 import json
+import secrets
 import logging
 import math
 import sqlite3
@@ -27,7 +29,10 @@ from . import crypto, package
 from .auth import AuthFile
 from .config import Settings
 from .db import SCHEMA_VERSION, Store
+from . import release as releasemod
+from .package import AFTER_OPEN_SECONDS, MAX_ABSOLUTE_SECONDS
 from .ratelimit import SqlRateLimiter
+from .release import ReleaseError, ReleaseService
 from .sessions import Session, SessionStore
 from .vault import Vault, VaultError
 
@@ -167,6 +172,22 @@ class PasswordChangeIn(BaseModel):
     new: str = Field(min_length=authmod.MIN_PASSWORD_LEN, max_length=authmod.MAX_PASSWORD_LEN)
 
 
+class PackageCreateIn(BaseModel):
+    entry_ids: list[int] = Field(min_length=1, max_length=200)
+    name: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=12, max_length=256)
+    allow_copy: bool = True
+    policy: str = Field(max_length=20)  # after_open | absolute | one_time
+    duration_minutes: int | None = Field(default=None, ge=1, le=43200)
+    absolute_minutes: int | None = Field(default=None, ge=1, le=43200)
+
+
+class ReleaseBody(BaseModel):
+    capability: str = Field(min_length=43, max_length=43)
+    nonce: str = Field(default="", max_length=128)
+    proof: str = Field(default="", max_length=128)
+
+
 class PackageExportIn(BaseModel):
     entry_ids: list[int] = Field(min_length=1, max_length=200)
     name: str = Field(min_length=1, max_length=100)
@@ -207,6 +228,8 @@ class AuthCache:
 class AppContext:
     def __init__(self, settings: Settings, clock: Callable[[], float], wall_clock: Callable[[], float]):
         self.settings = settings
+        self.wall_clock = wall_clock
+        self._release: ReleaseService | None = None
         self.store = Store(settings.db_path)
         self.auth = AuthCache(settings.auth_path)
         self.cookie_name = "__Host-pastry_session" if settings.cookie_secure else "pastry_session"
@@ -230,6 +253,16 @@ class AppContext:
         self.entry_limiter = SqlRateLimiter(
             self.store, settings.entry_max_failures, 600, settings.entry_lockout_minutes * 60, wall_clock,
         )
+        # Release API limits: failed proofs per capability, and request volume per client address.
+        self.release_fail_limiter = SqlRateLimiter(self.store, 5, 900, 900, wall_clock)
+        self.release_request_limiter = SqlRateLimiter(self.store, 30, 60, 60, wall_clock)
+
+    def release_service(self) -> ReleaseService:
+        """Created on first use, so installations without server-enforced packages never create release.key."""
+        if self._release is None:
+            kek = releasemod.load_or_create_kek(self.settings.release_key_path)
+            self._release = ReleaseService(self.store, kek, self.wall_clock)
+        return self._release
 
     def require_schema(self) -> None:
         """Refuse to serve a database that is not the current schema (for example before migration)."""
@@ -633,5 +666,165 @@ def create_app(
         filename = package.safe_filename(body.name)
         return Response(content=data, media_type="application/octet-stream",
                         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    # ----- server-enforced packages: owner API -----
+
+    def _gather_entries(session: Session, entry_ids: list[int]) -> list[dict]:
+        vault = ctx.vault(session)
+        entries = []
+        for entry_id in dict.fromkeys(entry_ids):
+            item = vault.get(entry_id, entry_keys(session, entry_id, touch=True))
+            if item.get("locked") and "username" not in item:
+                raise VaultError("locked", f"Unlock \"{item['name']}\" before exporting it.")
+            entries.append({
+                "name": item["name"], "url": item["url"], "username": item["username"],
+                "password": item["password"], "notes": item["notes"], "fields": item["fields"],
+            })
+        return entries
+
+    def _package_meta_aad(cap_hash: str) -> bytes:
+        return b"pastry:package-meta:v1|" + cap_hash.encode("ascii")
+
+    @app.post("/api/packages")
+    def create_package(body: PackageCreateIn, session: Session = Depends(require_write)):
+        """Create a server-enforced package. The release key stays on this server."""
+        if not settings.public_url:
+            raise HTTPException(422, "Set public_url in config/pastry.json to the HTTPS address recipients will use "
+                                     "(for example your Tailscale Serve address) before creating timed packages.")
+        now = ctx.wall_clock()
+        if body.policy == "after_open":
+            if body.duration_minutes is None or body.duration_minutes * 60 not in AFTER_OPEN_SECONDS:
+                raise HTTPException(422, "Choose an opening window of 5 minutes, 15 minutes, 1 hour or 24 hours.")
+            policy = {"type": "after_open", "seconds": body.duration_minutes * 60}
+            duration, absolute = body.duration_minutes * 60, None
+        elif body.policy == "absolute":
+            if body.absolute_minutes is None or body.absolute_minutes * 60 > MAX_ABSOLUTE_SECONDS:
+                raise HTTPException(422, "Choose an absolute deadline between 1 minute and 30 days.")
+            absolute = now + body.absolute_minutes * 60
+            policy = {"type": "absolute",
+                      "expires_at": datetime.fromtimestamp(absolute, timezone.utc).isoformat(timespec="seconds")}
+            duration = None
+        elif body.policy == "one_time":
+            policy, duration, absolute = {"type": "one_time"}, None, None
+        else:
+            raise HTTPException(422, "Unknown package policy.")
+
+        entries = _gather_entries(session, body.entry_ids)
+        svc = ctx.release_service()
+        salt = crypto.new_salt()
+        capability = secrets.token_bytes(32)
+        k_r = secrets.token_bytes(32)
+        k_pw, k_auth = package.derive_keys(body.password, salt, settings.kdf)
+        crypto.wipe(k_pw)
+        cap_hash = releasemod.cap_hash(capability)
+        meta_blob = crypto.seal(session.dek, json.dumps({"name": body.name, "allow_copy": body.allow_copy},
+                                                        separators=(",", ":")).encode(),
+                                _package_meta_aad(cap_hash))
+        from .release import NewPackage
+
+        pkg = NewPackage(owner=session.username, capability=capability, policy=body.policy,
+                         duration_seconds=duration, absolute_expires_at=absolute,
+                         entry_count=len(entries), meta_blob=meta_blob, file_blob=b"",
+                         k_r=k_r, k_auth=k_auth)
+        package_id = svc.create(pkg, now)
+        try:
+            data = package.build_server_package(
+                entries, body.name, allow_copy=body.allow_copy, policy=policy, release_url=settings.public_url,
+                package_id=package_id, capability=capability, salt=salt, kdf=settings.kdf, k_r=k_r,
+                now=datetime.fromtimestamp(now, timezone.utc),
+            )
+        except package.PackageError as exc:
+            svc.delete(session.username, package_id)
+            raise HTTPException(422, str(exc)) from exc
+        finally:
+            crypto.wipe(bytearray(k_r))
+        svc.set_file(package_id, data, session.username)
+        return Response(content=data, media_type="application/octet-stream", headers={
+            "Content-Disposition": f'attachment; filename="{package.safe_filename(body.name)}"',
+            "X-Pastry-Package-Id": str(package_id),
+        })
+
+    @app.get("/api/packages")
+    def list_packages(session: Session = Depends(require_session)):
+        svc = ctx.release_service()
+        out = []
+        for item in svc.list_for(session.username):
+            meta = json.loads(crypto.open_sealed(session.dek, item.pop("meta_blob"),
+                                                 _package_meta_aad(item.pop("cap_hash"))))
+            item["name"] = meta["name"]
+            item["allow_copy"] = meta["allow_copy"]
+            out.append(item)
+        return {"packages": out}
+
+    @app.get("/api/packages/{package_id}/file")
+    def download_package(package_id: int, session: Session = Depends(require_session)):
+        data = ctx.release_service().get_file(session.username, package_id)
+        return Response(content=data, media_type="application/octet-stream", headers={
+            "Content-Disposition": 'attachment; filename="package.pastry"'})
+
+    @app.post("/api/packages/{package_id}/revoke", status_code=204)
+    def revoke_package(package_id: int, session: Session = Depends(require_write)):
+        ctx.release_service().revoke(session.username, package_id)
+        return Response(status_code=204)
+
+    @app.delete("/api/packages/{package_id}", status_code=204)
+    def delete_package(package_id: int, session: Session = Depends(require_write)):
+        ctx.release_service().delete(session.username, package_id)
+        return Response(status_code=204)
+
+    # ----- server-enforced packages: public release API (no vault session) -----
+    # These routes touch only the packages and release_nonces tables. They never read
+    # vault entries, sessions or the vault key. See docs/CRYPTOGRAPHY-V12.md, section 10.
+
+    def _release_guard(request: Request, capability_text: str):
+        ctx.require_schema()
+        client = f"rel-ip:{_client_ip(request)}"
+        if ctx.release_request_limiter.blocked_for(client):
+            raise HTTPException(429, "Too many requests. Wait a minute and try again.")
+        ctx.release_request_limiter.record_failure(client)
+        try:
+            capability = releasemod.decode_capability(capability_text)
+        except ReleaseError as exc:
+            raise HTTPException(exc.status, exc.message) from exc
+        cap_key = f"rel-cap:{releasemod.cap_hash(capability)}"
+        if ctx.release_fail_limiter.blocked_for(cap_key):
+            raise HTTPException(429, "Too many failed attempts for this package. Try again later.")
+        return capability, cap_key
+
+    def _release_error(exc: ReleaseError) -> JSONResponse:
+        return JSONResponse({"detail": exc.message, "code": exc.code}, status_code=exc.status)
+
+    @app.post("/release/v1/status")
+    def release_status(body: ReleaseBody, request: Request):
+        capability, _ = _release_guard(request, body.capability)
+        try:
+            return ctx.release_service().status(capability)
+        except ReleaseError as exc:
+            return _release_error(exc)
+
+    @app.post("/release/v1/challenge")
+    def release_challenge(body: ReleaseBody, request: Request):
+        capability, _ = _release_guard(request, body.capability)
+        try:
+            return {"nonce": ctx.release_service().challenge(capability)}
+        except ReleaseError as exc:
+            return _release_error(exc)
+
+    @app.post("/release/v1/redeem")
+    def release_redeem(body: ReleaseBody, request: Request):
+        capability, cap_key = _release_guard(request, body.capability)
+        try:
+            proof = base64.b64decode(body.proof, validate=True)
+        except (ValueError, TypeError):
+            return JSONResponse({"detail": "Malformed proof.", "code": "invalid"}, status_code=422)
+        if len(proof) != 32 or not body.nonce:
+            return JSONResponse({"detail": "Malformed proof.", "code": "invalid"}, status_code=422)
+        try:
+            return ctx.release_service().redeem(capability, body.nonce, proof)
+        except ReleaseError as exc:
+            if exc.code == "bad_password":
+                ctx.release_fail_limiter.record_failure(cap_key)
+            return _release_error(exc)
+
 
     return app

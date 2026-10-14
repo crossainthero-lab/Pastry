@@ -1,4 +1,4 @@
-"""SQLite storage (schema v2). Every user-supplied value lives inside an encrypted blob.
+"""SQLite storage (schema v3). Every user-supplied value lives inside an encrypted blob.
 
 Plaintext columns are limited to: the row id, a random per-entry uid (used as
 AAD, not secret) and the blobs themselves. Timestamps, the locked flag, and the
@@ -13,9 +13,40 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
-SCHEMA = """
+PACKAGE_STATEMENTS = (
+    """
+CREATE TABLE IF NOT EXISTS packages (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner            TEXT NOT NULL,
+    cap_hash         TEXT NOT NULL UNIQUE,        -- SHA-256 of the capability
+    state            TEXT NOT NULL CHECK (state IN ('active', 'revoked', 'consumed', 'expired')),
+    policy           TEXT NOT NULL CHECK (policy IN ('after_open', 'absolute', 'one_time')),
+    duration_seconds INTEGER,                     -- after_open: window length from first release
+    expires_at       REAL,                        -- absolute deadline, or window end once started
+    first_released_at REAL,
+    created_at       REAL NOT NULL,
+    entry_count      INTEGER NOT NULL,
+    meta_blob        BLOB NOT NULL,               -- sealed under the vault key: name, allow_copy
+    file_blob        BLOB NOT NULL,               -- encrypted .pastry file (a copy for download)
+    release_blob     BLOB,                        -- K_r sealed under release_kek; NULL once terminal
+    auth_blob        BLOB                         -- K_auth sealed under release_kek; NULL once terminal
+)
+""",
+    """
+CREATE TABLE IF NOT EXISTS release_nonces (
+    nonce      TEXT PRIMARY KEY,
+    package_id INTEGER NOT NULL,
+    expires_at REAL NOT NULL
+)
+""",
+)
+# Server-enforced packages (schema v3). Release material is sealed under release_kek,
+# which lives in config/release.key and is excluded from backups (docs/CRYPTOGRAPHY-V12.md, 10.2).
+PACKAGE_SCHEMA = ";\n".join(PACKAGE_STATEMENTS) + ";"
+
+_BASE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -32,6 +63,7 @@ CREATE TABLE IF NOT EXISTS rate_limits (
     blocked_until REAL NOT NULL DEFAULT 0
 );
 """
+SCHEMA = _BASE_SCHEMA + PACKAGE_SCHEMA
 
 
 class SchemaError(Exception):

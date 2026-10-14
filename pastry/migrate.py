@@ -17,7 +17,7 @@ import json
 from typing import Callable
 
 from . import crypto
-from .db import SCHEMA_VERSION, Store
+from .db import PACKAGE_STATEMENTS, SCHEMA_VERSION, Store
 from .vault import META_AAD_PREFIX
 
 V1_META_PREFIX = b"pastry:meta:"
@@ -95,10 +95,27 @@ def migrate_v1_to_v2(
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(SCHEMA_VERSION),),
+            ("2",),  # this step produces schema v2 exactly; v2 -> v3 is migrate_v2_to_v3
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rate_limits (key TEXT PRIMARY KEY, failures TEXT NOT NULL, "
             "blocked_until REAL NOT NULL DEFAULT 0)"
         )
     return len(rows)
+
+
+def migrate_v2_to_v3(store: Store) -> None:
+    """Additive: add the package and nonce tables. No existing data is touched.
+
+    Needs no password: nothing is re-encrypted. Runs in one transaction.
+    """
+    if store.schema_version() != 2:
+        raise MigrationError("The database is not schema v2; nothing to migrate.")
+    with store.transaction() as conn:
+        for statement in PACKAGE_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),),
+        )

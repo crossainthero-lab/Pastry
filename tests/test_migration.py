@@ -12,7 +12,7 @@ from pastry import cli
 from pastry.backup import verify_backup
 from pastry.config import Settings
 from pastry.db import SchemaError, Store
-from pastry.migrate import MigrationError, migrate_v1_to_v2
+from pastry.migrate import MigrationError, migrate_v1_to_v2, migrate_v2_to_v3
 from pastry.vault import Vault
 from pastry.web import create_app
 from tests.conftest import FAST_KDF, login
@@ -103,7 +103,7 @@ def test_cli_migrate_creates_backup_first_and_verifies(v1_home, capsys):
     # The pre-migration backup is a valid v1 archive that can be restored if needed.
     report = verify_backup(v1_home, backups[0])
     assert report.schema_version == 1 and report.entry_count == 2
-    assert Store(v1_home.db_path).schema_version() == 2
+    assert Store(v1_home.db_path).schema_version() == 3
 
 
 def test_cli_migrate_with_wrong_password_changes_nothing(v1_home, capsys):
@@ -132,6 +132,7 @@ def test_start_command_refuses_unmigrated_vault(v1_home, capsys):
 
 def test_migrated_vault_serves_normally(v1_home):
     migrate_v1_to_v2(Store(v1_home.db_path), _dek(v1_home))
+    migrate_v2_to_v3(Store(v1_home.db_path))
     client = TestClient(create_app(v1_home), base_url="https://testserver")
     assert login(client, "owner", V1_PASSWORD).status_code == 303
     names = sorted(e["name"] for e in client.get("/api/entries").json()["entries"])

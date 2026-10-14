@@ -180,7 +180,7 @@ def verify_backup(settings: Settings, archive: Path, password: str | None = None
 
         auth = authmod.read_auth(auth_path)  # raises AuthError when malformed
         schema = store.schema_version()
-        entries = store.entry_count() if schema in (1, 2) else 0
+        entries = store.entry_count() if schema in (1, 2, 3) else 0
         if manifest is not None and manifest["entry_count"] != entries:
             raise BackupError("Entry count does not match the manifest.")
 
@@ -194,7 +194,7 @@ def verify_backup(settings: Settings, archive: Path, password: str | None = None
         )
         if schema == 1:
             report.notes.append("Schema v1 database: run `pastry migrate` after restoring.")
-        elif schema != 2:
+        elif schema not in (2, 3):
             raise BackupError(f"Unknown database schema version {schema}.")
 
         if password is not None:
@@ -202,7 +202,7 @@ def verify_backup(settings: Settings, archive: Path, password: str | None = None
             if dek is None:
                 raise BackupError("The password does not unlock this backup's vault key.")
             try:
-                if schema == 2:
+                if schema >= 2:
                     vault = Vault(store, dek, auth.kdf)
                     unlocked = protected = 0
                     for item in vault.list({}):

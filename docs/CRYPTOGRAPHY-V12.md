@@ -95,3 +95,86 @@ Wrong password, tampered header, tampered payload and corrupted wrapping all pro
 - The package name and creation time are plaintext.
 - File size and the number of bytes reveal approximately how much is stored.
 - An Argon2id-protected password can still be guessed offline by anyone with the file. Use a long, random package password. The export dialog offers a generator. Passwords under 12 characters are refused.
+
+---
+
+## 10. Server-enforced packages (access "server", design version 1)
+
+Status: designed and implemented in this branch. **Self-review only. This has not been independently reviewed, and must not be treated as reviewed.**
+
+### 10.1 Goal and rule
+
+A server-enforced package must not be decryptable from the file and the package password alone. Decryption needs a **release key** `K_r` that only the originating Pastry server releases, after a successful release protocol. There is no code path that derives the payload key from the password. Nothing in the file is password-verifiable offline.
+
+### 10.2 Keys
+
+| Name | Size | Created by | Lives where | Purpose |
+|---|---|---|---|---|
+| `K_r` release key | 256-bit random | server, at export | server DB, sealed under `release_kek` | wraps the package DEK |
+| `DEK` package data key | 256-bit random | server, at export | only in the file (wrapped by `K_r`) and in memory | encrypts the payload |
+| `K_pw` | 256-bit | derived | memory only, both sides | Argon2id(package password, salt, params) |
+| `K_auth` | 256-bit | derived | server DB sealed under `release_kek`; client memory | HKDF-SHA256(`K_pw`, info `pastry-release-auth/v1`) |
+| `release_kek` | 256-bit random | server, first use | `config/release.key`, mode 0600, **excluded from backups** | seals `K_r` and `K_auth` at rest |
+| capability | 256-bit random | server, at export | in the file header; server stores SHA-256 of it | identifies the package to the release API |
+| nonce | 256-bit random | server, per challenge | server DB, single use, 120 s | prevents replay |
+
+Primitives: AES-256-GCM (`cryptography`), Argon2id (`argon2-cffi`), HKDF-SHA256 and HMAC-SHA256 (`cryptography` / `hmac`), `secrets` for randomness. Nonces for AES-GCM are random 96-bit values.
+
+### 10.3 File layout (access "server")
+
+Same envelope as offline packages (magic, version 1, length, header JSON), but:
+
+- `wrapped_dek` = AES-256-GCM(`K_r`, `DEK`, aad = header prefix). The file holds **no** password-derived ciphertext.
+- `payload` = AES-256-GCM(`DEK`, payload JSON, aad = header prefix).
+- Header adds: `policy` (`after_open` with `seconds`, `absolute` with `expires_at`, or `one_time`), `package_id`, `capability` (base64), `release_url` (https origin of the issuing server), and `kdf` with `salt` for `K_pw`.
+
+### 10.4 Release protocol (TLS to the issuing server)
+
+1. **Status** `POST /release/v1/status {capability}`: returns `active | expired | revoked | consumed` and, when relevant, `expires_at`. Unknown capability returns 404. Rate-limited.
+2. **Challenge** `POST /release/v1/challenge {capability}`: if the package is not active, returns its state (410 or 409). If active, returns a fresh single-use nonce `n`. The nonce is stored with its package ID and a 120-second expiry.
+3. **Client** derives `K_pw` and `K_auth` from the password and salt, then computes `proof = HMAC-SHA256(K_auth, "pastry-release-proof/v1" || package_id || n)`.
+4. **Redeem** `POST /release/v1/redeem {capability, nonce, proof}`. In one `BEGIN IMMEDIATE` transaction the server:
+   - deletes the nonce (it can be used once, whether or not the proof is right);
+   - rechecks the package state against the server clock;
+   - verifies `proof` against the stored `K_auth` using a constant-time comparison;
+   - on success, for an `after_open` package with no prior release, sets `expires_at = now + seconds`; for a `one_time` package, sets state `consumed`;
+   - returns `wrap = AES-256-GCM(K_auth, K_r, aad = "pastry-release-wrap/v1" || package_id || n)`. The key is wrapped under `K_auth` so a TLS-terminating intermediary still cannot read it.
+5. The client unwraps `K_r`, then decrypts the DEK and payload. All key material is wiped after the viewer closes.
+
+### 10.5 Policy and state machine
+
+- `after_open`: the timer starts at the first successful release. Later releases during the window are allowed, so the recipient can reopen. Expiry is absolute once started.
+- `absolute`: `expires_at` is fixed at creation.
+- `one_time`: the first successful release consumes the package. Later attempts report "already redeemed".
+- Manual revocation by the owner is available at any time.
+- Terminal states (`expired`, `revoked`, `consumed`) erase `K_r` and `K_auth` from the database. The file can then never be decrypted by any server path.
+- Every transition runs in `BEGIN IMMEDIATE`, so concurrent redemptions are serialised. Two concurrent requests for a one-time package produce exactly one release.
+
+### 10.6 Rate limits and oracles
+
+- Failed proofs: 5 per capability in 15 minutes, then a 15-minute lockout for that capability.
+- Challenges: 30 per client address per minute. Behind Tailscale Serve, all clients share one local address, so this limit is shared too. The capability limit is the one that matters.
+- A wrong password returns the same message whether or not the package exists, so a guess yields no information beyond "not accepted". State messages (expired, revoked, consumed) are shown only to a holder of the capability, and they describe the package, not the password.
+
+### 10.7 Threat analysis
+
+| Scenario | Outcome |
+|---|---|
+| File plus password, no server | Cannot decrypt. There is no password-only path. |
+| File, password and capability, after revoke or expiry | Server refuses. `K_r` has been erased. |
+| File and password, server reachable, package active | Decrypts, by design, after the release protocol. |
+| Recipient already holds `K_r` after a release | **Can decrypt the file indefinitely.** The server cannot take back a key it has already released. |
+| Replay of a redeem request | Fails: the nonce is single-use. |
+| Wrong password guesses | Each guess needs a challenge and a redeem, is rate-limited per capability, and reveals nothing beyond "not accepted". |
+| Stolen server DB alone | `K_r` and `K_auth` are sealed. Not decryptable without `release_kek`. |
+| Stolen server DB plus `release.key` | Attacker can guess the password offline against `K_auth` (Argon2id cost), then obtain `K_r`. Serious. Mitigation: keep `release.key` out of backups, and keep file permissions tight. |
+| Malicious file with a different `release_url` | The CLI shows the host and asks for confirmation before sending anything. A host the user confirms receives an offline-guessable proof. Mitigation: check the host. |
+| Sender's server sees the password at export | The password passes through the server once, in memory, to derive `K_pw` and `K_auth`. It is not stored. This is an accepted trust in the issuing server, which the sender runs. |
+| Oracle through package state | State is shown only to capability holders, and it describes the package, not the password. |
+| Vault compromise | Release tables are separate, and the release API never reads vault tables or sessions. Vault keys are not involved. |
+
+### 10.8 What is not prevented
+
+- A recipient who has obtained `K_r` can keep a copy of it, and the file, indefinitely. The server cannot prevent this, and the viewer cannot either. Expiry only stops future server releases.
+- Python and the operating system may keep copies of keys and plaintext in memory or swap. Best-effort clearing only.
+- The "one-time" guarantee is about server releases, not about what the recipient retains.
