@@ -21,7 +21,13 @@
     openEntryId: null,
     toastTimer: null,
     searchTimer: null,
+    selected: new Set(),
+    exportButton: null,
+    shared: false,   // true while viewing an entry someone shared with this account
   };
+
+  const entryApi = (id) => `${state.shared ? "/api/shared" : "/api/entries"}/${id}`;
+  const entryHash = (id) => `#/${state.shared ? "shared" : "entry"}/${id}`;
 
   // ----- DOM helper -------------------------------------------------------
 
@@ -210,6 +216,9 @@
     if (head === undefined) document.querySelector('[data-nav="all"]').setAttribute("aria-current", "page");
     if (head === "favourites") document.querySelector('[data-nav="favourites"]').setAttribute("aria-current", "page");
     if (head === "settings") document.querySelector('[data-nav="settings"]').setAttribute("aria-current", "page");
+    if (head === "packages") document.querySelector('[data-nav="packages"]').setAttribute("aria-current", "page");
+    if (head === "users") document.querySelector('[data-nav="users"]').setAttribute("aria-current", "page");
+    if (head === "shared") document.querySelector('[data-nav="shared"]').setAttribute("aria-current", "page");
     if (head === "category") {
       document.querySelectorAll("#category-list a").forEach((link) => {
         if (link.dataset.category === arg) link.setAttribute("aria-current", "page");
@@ -227,7 +236,8 @@
 
   async function route() {
     const [head, arg, sub] = currentRoute();
-    const nextEntry = head === "entry" ? Number(arg) : null;
+    const nextEntry = head === "entry" || (head === "shared" && arg) ? Number(arg) : null;
+    state.shared = head === "shared";
     if (state.openEntryId !== null && state.openEntryId !== nextEntry) {
       const previous = state.openEntryId;
       state.openEntryId = null;
@@ -235,7 +245,7 @@
     }
     state.openEntryId = nextEntry;
     highlightNav(head, arg);
-    toolbar.hidden = head === "settings";
+    toolbar.hidden = ["settings", "packages", "users", "shared"].includes(head);
     setNavOpen(false);
 
     try {
@@ -252,11 +262,11 @@
         state.listSpec = null;
         await refreshCategories();
         await showEditor(null);
-      } else if (head === "entry" && sub === "edit") {
+      } else if ((head === "entry" || (head === "shared" && arg)) && sub === "edit") {
         state.listSpec = null;
         await refreshCategories();
         await showEditor(nextEntry);
-      } else if (head === "entry") {
+      } else if (head === "entry" || (head === "shared" && arg)) {
         state.listSpec = null;
         await refreshCategories();
         await showDetail(nextEntry);
@@ -264,6 +274,18 @@
         state.listSpec = null;
         await refreshCategories();
         await showSettings();
+      } else if (head === "packages") {
+        state.listSpec = null;
+        await refreshCategories();
+        await showPackages();
+      } else if (head === "users") {
+        state.listSpec = null;
+        await refreshCategories();
+        await showUsers();
+      } else if (head === "shared") {
+        state.listSpec = null;
+        await refreshCategories();
+        await showSharedList();
       } else {
         location.hash = "#/";
       }
@@ -330,26 +352,39 @@
     } else {
       body = h("div", { class: "list" }, ...items.map(entryRow));
     }
+    state.exportButton = h("button", { class: "btn small", type: "button", text: "Export as Pastry", onclick: () => openExport([...state.selected]) });
     view.replaceChildren(
-      h("div", { class: "view-head" }, h("h1", { text: spec.title }), h("span", { class: "muted small", text: countText })),
+      h(
+        "div",
+        { class: "view-head" },
+        h("h1", { text: spec.title }),
+        h("div", { class: "export-head" }, state.exportButton, h("span", { class: "muted small", text: countText })),
+      ),
       body,
     );
+    updateExportButton();
   }
 
   function entryRow(entry) {
-    return h(
+    const box = h("input", { type: "checkbox", "aria-label": `Select ${entry.name} for export`, checked: state.selected.has(entry.id) });
+    box.addEventListener("change", () => {
+      if (box.checked) state.selected.add(entry.id);
+      else state.selected.delete(entry.id);
+      updateExportButton();
+    });
+    const link = h(
       "a",
-      { class: "entry-row", href: `#/entry/${entry.id}` },
+      { class: "entry-main", href: `#/entry/${entry.id}` },
       h(
         "div",
         {},
         h(
           "div",
           { class: "entry-title" },
-          entry.favourite ? h("span", { class: "star", "aria-label": "Favourite", text: "★" }) : null,
+          entry.favourite ? h("span", { class: "star", "aria-label": "Favourite", text: "\u2605" }) : null,
           h("span", { text: entry.name }),
         ),
-        h("div", { class: "entry-sub", text: entry.url || " " }),
+        h("div", { class: "entry-sub", text: entry.url || " " }),
       ),
       h(
         "div",
@@ -358,6 +393,15 @@
         entry.category ? h("span", { class: "badge", text: entry.category }) : null,
       ),
     );
+    return h("div", { class: "entry-row" }, box, link);
+  }
+
+  function updateExportButton() {
+    const btn = state.exportButton;
+    if (!btn) return;
+    const n = state.selected.size;
+    btn.disabled = n === 0;
+    btn.textContent = n ? `Export as Pastry (${n})` : "Export as Pastry";
   }
 
   // ----- entry details ----------------------------------------------------
@@ -411,7 +455,7 @@
           submit.disabled = true;
           errorEl.hidden = true;
           try {
-            await api.post(`/api/entries/${entry.id}/unlock`, { password: input.value });
+            await api.post(`${entryApi(entry.id)}/unlock`, { password: input.value });
             await showDetail(entry.id);
           } catch (err) {
             if (err.status === 401) return;
@@ -472,12 +516,22 @@
   }
 
   async function showDetail(id) {
-    const entry = await api.get(`/api/entries/${id}`);
+    const entry = await api.get(entryApi(id));
     const locked = entry.locked && !entry.unlocked;
+    const shared = Boolean(entry.shared);
     const actions = [];
-    if (!locked) actions.push(h("a", { class: "btn", href: `#/entry/${id}/edit`, text: "Edit" }));
-    actions.push(h("button", { class: "btn danger", type: "button", text: "Delete", onclick: () => deleteEntry(entry) }));
-    if (entry.locked && entry.unlocked) {
+    if (!locked && (!shared || entry.can_edit)) actions.push(h("a", { class: "btn", href: `${entryHash(id)}/edit`, text: "Edit" }));
+    if (!shared || entry.can_export) {
+      actions.push(h("button", { class: "btn", type: "button", text: "Export as Pastry", disabled: locked, onclick: () => openExport([id]) }));
+    }
+    if (!shared) {
+      actions.push(h("button", { class: "btn", type: "button", text: "Share", onclick: () => openShare(entry) }));
+      actions.push(h("button", { class: "btn danger", type: "button", text: "Delete", onclick: () => deleteEntry(entry) }));
+    }
+    if (shared && entry.locked && entry.unlocked) {
+      actions.push(h("button", { class: "btn", type: "button", text: "Lock now", onclick: () => relock(entry.id) }));
+    }
+    if (!shared && entry.locked && entry.unlocked) {
       actions.push(
         h("button", { class: "btn", type: "button", text: "Lock now", onclick: () => relock(entry.id) }),
         h("button", { class: "btn", type: "button", text: "Change separate password", onclick: () => changeSeparate(entry.id) }),
@@ -495,6 +549,8 @@
         h("h1", { text: entry.name }),
       ),
       entry.category ? h("div", { class: "muted small", text: entry.category }) : null,
+      shared ? h("div", { class: "muted small", text: `Shared by ${entry.owner} \u00b7 ${permissionLabel(entry)}` }) : null,
+      !shared && entry.shared_with ? h("div", { class: "muted small", text: `Shared with ${entry.shared_with} account(s)` }) : null,
       h("div", { class: "detail-actions" }, actions),
     );
 
@@ -565,6 +621,469 @@
     }
   }
 
+  // ----- Export as Pastry ---------------------------------------------------
+
+  const AFTER_OPEN_CHOICES = [["5", "5 minutes after opening"], ["15", "15 minutes after opening"],
+    ["60", "1 hour after opening"], ["1440", "24 hours after opening"]];
+
+  function packageStatusText(p) {
+    const labels = { active: "Active", expired: "Expired", revoked: "Revoked", consumed: "Redeemed (one-time)" };
+    if (p.policy === "after_open" && p.state === "active" && !p.expires_at) return "Active (not opened yet)";
+    return labels[p.state] || p.state;
+  }
+
+  function policyText(p) {
+    if (p.policy === "after_open") return `Window of ${Math.round((p.duration_seconds || 0) / 60)} min after opening`;
+    if (p.policy === "absolute") return "Absolute deadline";
+    return "One-time";
+  }
+
+  async function openExport(ids) {
+    if (!ids.length) return toast("Select at least one entry");
+    let timed = false;
+    try {
+      timed = Boolean((await api.get("/api/settings")).timed_packages);
+    } catch (err) {
+      if (err.status === 401) return;
+    }
+    const nameInput = h("input", { type: "text", maxlength: "100", value: "Credential package", "aria-label": "Package name" });
+    const pwInput = h("input", { type: "password", maxlength: "256", autocomplete: "new-password", "aria-label": "Package password", class: "mono" });
+    const pwRepeat = h("input", { type: "password", maxlength: "256", autocomplete: "new-password", "aria-label": "Repeat package password" });
+    const genLength = h("input", { type: "range", min: "16", max: "48", value: "24", "aria-label": "Generated length" });
+    const genOutput = h("output", { class: "small muted", text: "24" });
+    genLength.addEventListener("input", () => { genOutput.textContent = genLength.value; });
+    const generate = h("button", {
+      class: "btn small", type: "button", text: "Generate",
+      onclick: () => {
+        const result = generatePassword(Number(genLength.value), { upper: true, lower: true, digits: true, symbols: true });
+        pwInput.value = result.value;
+        pwRepeat.value = result.value;
+        pwInput.type = "text";
+        pwRepeat.type = "text";
+      },
+    });
+    const copyYes = h("input", { type: "radio", name: "allow-copy", value: "yes", checked: true });
+    const copyNo = h("input", { type: "radio", name: "allow-copy", value: "no" });
+
+    // Access type. Server-enforced choices need public_url to be configured on the server.
+    const modeOffline = h("input", { type: "radio", name: "mode", value: "offline", checked: true });
+    const modeAfter = h("input", { type: "radio", name: "mode", value: "after_open", disabled: !timed });
+    const modeAbsolute = h("input", { type: "radio", name: "mode", value: "absolute", disabled: !timed });
+    const modeOnce = h("input", { type: "radio", name: "mode", value: "one_time", disabled: !timed });
+    const afterSelect = h("select", { "aria-label": "Window after opening" }, AFTER_OPEN_CHOICES.map(([v, t]) => h("option", { value: v, text: t })));
+    const absoluteMinutes = h("input", { type: "number", min: "1", max: "43200", value: "120", "aria-label": "Deadline in minutes from now" });
+    const offlineExpiry = h("select", { "aria-label": "Advisory expiry" }, [
+      ["5", "5 minutes"], ["15", "15 minutes"], ["60", "1 hour"], ["1440", "24 hours"], ["10080", "7 days"],
+    ].map(([v, t]) => h("option", { value: v, text: t })));
+    offlineExpiry.value = "1440";
+    const error = h("p", { class: "error", role: "alert", hidden: true });
+    const dlg = h("dialog", { "aria-labelledby": "export-title" });
+    const close = () => dlg.close();
+    const selectedMode = () => document.querySelector("input[name=mode]:checked")?.value || "offline";
+
+    function fail(message) {
+      error.textContent = message;
+      error.hidden = false;
+    }
+
+    async function submit() {
+      error.hidden = true;
+      if (!nameInput.value.trim()) return fail("Give the package a name.");
+      if (pwInput.value.length < MIN_SECRET_LENGTH) return fail(`The package password needs at least ${MIN_SECRET_LENGTH} characters.`);
+      if (pwInput.value !== pwRepeat.value) return fail("The package passwords do not match.");
+      const mode = selectedMode();
+      try {
+        let res;
+        if (mode === "offline") {
+          res = await fetchRaw("POST", "/api/packages/export", {
+            entry_ids: ids, name: nameInput.value.trim(), password: pwInput.value,
+            allow_copy: copyYes.checked, access: "offline", expires_in_minutes: Number(offlineExpiry.value),
+          });
+        } else {
+          const body = {
+            entry_ids: ids, name: nameInput.value.trim(), password: pwInput.value, allow_copy: copyYes.checked,
+            policy: mode,
+            duration_minutes: mode === "after_open" ? Number(afterSelect.value) : null,
+            absolute_minutes: mode === "absolute" ? Number(absoluteMinutes.value) : null,
+          };
+          res = await fetchRaw("POST", "/api/packages", body);
+        }
+        if (res.status === 401) return redirectToLogin();
+        if (!res.ok) {
+          let detail = `Export failed (${res.status}).`;
+          try { detail = (await res.json()).detail || detail; } catch (err) { /* not JSON */ }
+          return fail(detail);
+        }
+        const blob = await res.blob();
+        const match = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") || "");
+        const url = URL.createObjectURL(blob);
+        const link = h("a", { href: url, download: match ? match[1] : "package.pastry" });
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        close();
+        toast(mode === "offline"
+          ? "Package downloaded. Send its password through a different channel."
+          : "Package created. It stays on this server and can be revoked from Packages.");
+      } catch (err) {
+        fail(err.message);
+      }
+    }
+
+    dlg.append(h(
+      "div",
+      { class: "dialog-body export-body" },
+      h("h2", { id: "export-title", text: `Export ${ids.length} ${ids.length === 1 ? "entry" : "entries"} as Pastry` }),
+      h("p", { text: "The package is encrypted with its own password and contains only the entries listed here." }),
+      h("label", { class: "field" }, h("span", { text: "Package name" }), nameInput),
+      h("label", { class: "field" }, h("span", { text: "Package password (at least 12 characters)" }),
+        h("div", { class: "input-with-action" }, pwInput, generate)),
+      h("div", { class: "row-line" }, h("span", { class: "small", text: "Generator length" }), genLength, genOutput),
+      h("label", { class: "field" }, h("span", { text: "Repeat package password" }), pwRepeat),
+      h("fieldset", { class: "choice" }, h("legend", { text: "Allow copying in the viewer" }),
+        h("label", {}, copyYes, "Yes"), h("label", {}, copyNo, "No")),
+      h("fieldset", { class: "choice" }, h("legend", { text: "Access type" }),
+        h("label", {}, modeOffline, "Offline encrypted file (opens without the server; expiry is advisory)"),
+        h("div", { class: "indent" }, h("label", { class: "field" }, h("span", { text: "Advisory expiry" }), offlineExpiry)),
+        h("label", { class: timed ? "" : "muted" }, modeAfter, "Expires after opening (server-enforced)"),
+        h("div", { class: "indent" }, afterSelect),
+        h("label", { class: timed ? "" : "muted" }, modeAbsolute, "Absolute deadline (server-enforced), minutes from now"),
+        h("div", { class: "indent" }, absoluteMinutes),
+        h("label", { class: timed ? "" : "muted" }, modeOnce, "One-time (the first successful open uses it up; server-enforced)")),
+      timed ? null : h("p", { class: "warn", text: "Server-enforced packages need public_url in the server's config/pastry.json, set to the HTTPS address recipients use. The options are off until then." }),
+      h("p", { class: "help", text: "Server-enforced packages cannot be opened if the server is unreachable. Revocation and expiry are enforced by the server clock. A recipient who has already opened a package may keep a copy of what they saw." }),
+      error,
+      h("div", { class: "dialog-actions" },
+        h("button", { class: "btn", type: "button", text: "Cancel", onclick: close }),
+        h("button", { class: "btn primary", type: "button", text: "Create package", onclick: submit })),
+    ));
+    dlg.addEventListener("close", () => {
+      pwInput.value = "";
+      pwRepeat.value = "";
+      dlg.remove();
+    });
+    document.body.append(dlg);
+    dlg.showModal();
+    nameInput.focus();
+  }
+
+  // ----- Packages page ------------------------------------------------------
+
+  async function showPackages() {
+    const data = await api.get("/api/packages");
+    const rows = data.packages.map((p) => {
+      const actions = [];
+      if (p.has_file) {
+        actions.push(h("a", { class: "btn small", href: `/api/packages/${p.id}/file`, download: "", text: "Download" }));
+      }
+      if (p.state === "active") {
+        actions.push(h("button", { class: "btn small", type: "button", text: "Revoke", onclick: () => revokePackage(p) }));
+      }
+      actions.push(h("button", { class: "btn small danger", type: "button", text: "Delete", onclick: () => deletePackage(p) }));
+      return h(
+        "div",
+        { class: "kv pkg" },
+        h("div", { class: "k" }, h("div", { text: p.name }), h("div", { class: "small muted", text: `${p.entry_count} entries · ${policyText(p)}` })),
+        h("div", { class: "v plain" }, h("div", { text: `Created ${formatDate(p.created_at)}` }),
+          h("div", { class: "small muted", text: p.expires_at ? `Expires ${formatDate(p.expires_at)}` : "No expiry yet" })),
+        h("div", { class: "actions wrap" }, h("span", { class: "badge", text: packageStatusText(p) }), actions),
+      );
+    });
+    view.replaceChildren(
+      h("div", { class: "view-head" }, h("h1", { text: "Packages" }), h("span", { class: "muted small", text: `${data.packages.length} total` })),
+      h("p", { class: "help", text: "Server-enforced packages are listed here. Revoke stops future releases. Delete removes the record and the stored copy. Passwords are never stored or shown again." }),
+      rows.length ? h("div", { class: "panel" }, h("div", { class: "panel-body" }, rows)) : h("div", { class: "empty" }, h("h2", { text: "No packages yet" }), h("p", { text: "Select entries and choose Export as Pastry to create one." })),
+    );
+  }
+
+  async function revokePackage(p) {
+    const ok = await dialog({
+      title: "Revoke this package?",
+      message: "Recipients can no longer open it through the server. Copies already opened keep what the recipient saw. This cannot be undone.",
+      confirmLabel: "Revoke",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.post(`/api/packages/${p.id}/revoke`);
+      toast("Package revoked");
+      showPackages();
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  async function deletePackage(p) {
+    const ok = await dialog({
+      title: "Delete this package record?",
+      message: "The server removes the package, its release key and its stored copy. Files already downloaded are not affected.",
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.del(`/api/packages/${p.id}`);
+      toast("Package deleted");
+      showPackages();
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  // ----- Users (owner only) and Shared With Me ----------------------------------
+
+  function formatShort(iso) {
+    return iso ? formatDate(iso) : "";
+  }
+
+  async function showUsers() {
+    const data = await api.get("/api/users");
+    const rows = data.accounts.map((a) => {
+      const actions = [];
+      if (a.role !== "owner") {
+        actions.push(h("button", {
+          class: "btn small danger",
+          type: "button",
+          disabled: a.disabled,
+          text: a.disabled ? "Disabled" : "Disable",
+          onclick: () => disableAccount(a),
+        }));
+      }
+      return h(
+        "div",
+        { class: "kv pkg" },
+        h("div", { class: "k" }, h("div", { text: a.username })),
+        h("div", { class: "v plain" }, h("div", { text: a.role === "owner" ? "Owner" : "Member" }),
+          h("div", { class: "small muted", text: a.created_at ? `Created ${formatShort(a.created_at)}` : "Owner account" })),
+        h("div", { class: "actions wrap" }, h("span", { class: "badge", text: a.disabled ? "disabled" : "active" }), actions),
+      );
+    });
+    const usernameInput = h("input", { type: "text", maxlength: "64", autocomplete: "off", "aria-label": "Username for the new account" });
+    const linkBox = h("div", { hidden: true, class: "invite-box" });
+    const form = h(
+      "form",
+      {
+        class: "inline-form",
+        onsubmit: async (event) => {
+          event.preventDefault();
+          try {
+            const result = await api.post("/api/users/invitations", { username: usernameInput.value.trim() });
+            const link = `${location.origin}${result.path}`;
+            linkBox.replaceChildren(
+              h("p", { text: `Invitation for ${result.username}. It works once and expires in ${result.expires_in_hours} hours. The new user chooses their own master password.` }),
+              h("p", { class: "mono invite-link", text: link }),
+              h("button", { class: "btn small", type: "button", text: "Copy link", onclick: () => copyText(link, "Invitation link copied") }),
+            );
+            linkBox.hidden = false;
+            usernameInput.value = "";
+          } catch (err) {
+            toast(err.message);
+          }
+        },
+      },
+      h("label", { class: "field" }, h("span", { text: "Create an invitation for a new account" }), usernameInput),
+      h("button", { class: "btn", type: "submit", text: "Create invitation" }),
+    );
+    const pending = data.invitations.length
+      ? h("p", { class: "help", text: `Pending invitations: ${data.invitations.length}. Each works once.` })
+      : null;
+    view.replaceChildren(
+      h("div", { class: "view-head" }, h("h1", { text: "Users" }), h("span", { class: "muted small", text: `${data.accounts.length} ${data.accounts.length === 1 ? "account" : "accounts"}` })),
+      h("p", { class: "help", text: "Each account has its own password and its own encrypted vault. You can manage accounts, but you cannot read another account's entries." }),
+      h("div", { class: "panel" }, h("div", { class: "panel-body" }, rows)),
+      h("section", { class: "editor-section" }, h("h2", { text: "Invite someone" }), form, linkBox, pending),
+    );
+  }
+
+  async function disableAccount(account) {
+    const ok = await dialog({
+      title: `Disable ${account.username}?`,
+      message: "They are signed out everywhere and cannot sign in. Their data stays encrypted on the server and is not deleted.",
+      confirmLabel: "Disable",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.post(`/api/users/${account.id}/disable`);
+      toast("Account disabled");
+      showUsers();
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  // ----- Share and Manage Access ---------------------------------------------------
+
+  function permissionLabel(p) {
+    if (p.can_edit && p.can_export) return "View, edit and export";
+    if (p.can_edit) return "View and edit";
+    if (p.can_export) return "View and export";
+    return "View only";
+  }
+
+  async function openShare(entry) {
+    let directory = [];
+    try {
+      directory = (await api.get("/api/directory")).accounts;
+    } catch (err) {
+      if (err.status === 401) return;
+      return toast(err.message);
+    }
+    const dlg = h("dialog", { "aria-labelledby": "share-title" });
+    const body = h("div", { class: "dialog-body export-body" });
+    dlg.append(body);
+
+    async function render() {
+      let data;
+      try {
+        data = await api.get(`/api/entries/${entry.id}/shares`);
+      } catch (err) {
+        if (err.status === 401) return;
+        body.replaceChildren(h("p", { class: "error", text: err.message }));
+        return;
+      }
+      const granted = new Set(data.access.map((a) => a.username));
+      const options = directory.filter((a) => !granted.has(a.username));
+      const select = h("select", { "aria-label": "Account to share with" },
+        options.length ? options.map((a) => h("option", { value: a.username, text: a.username }))
+          : [h("option", { value: "", text: "Every other account already has access", disabled: true })]);
+      const edit = h("input", { type: "checkbox" });
+      const exportBox = h("input", { type: "checkbox" });
+      const error = h("p", { class: "error", role: "alert", hidden: true });
+
+      const addButton = h("button", {
+        class: "btn primary", type: "button", text: "Share", disabled: options.length === 0,
+        onclick: async () => {
+          error.hidden = true;
+          try {
+            await api.post(`/api/entries/${entry.id}/shares`, {
+              username: select.value, can_edit: edit.checked, can_export: exportBox.checked,
+            });
+            toast(`Shared with ${select.value}`);
+            await render();
+          } catch (err) {
+            error.textContent = err.message;
+            error.hidden = false;
+          }
+        },
+      });
+
+      const rows = data.access.map((a) => h(
+        "div",
+        { class: "kv pkg" },
+        h("div", { class: "k" }, h("div", { text: a.username }),
+          h("div", { class: "small muted mono", text: a.fingerprint ? `Key ${a.fingerprint}` : "No key yet" })),
+        h("div", { class: "v plain", text: permissionLabel(a) }),
+        h("div", { class: "actions wrap" },
+          h("button", { class: "btn small", type: "button", text: a.can_edit ? "Make view-only" : "Allow edit",
+            onclick: () => changePermission(a, { can_edit: !a.can_edit, can_export: a.can_export }) }),
+          h("button", { class: "btn small", type: "button", text: a.can_export ? "Stop export" : "Allow export",
+            onclick: () => changePermission(a, { can_edit: a.can_edit, can_export: !a.can_export }) }),
+          h("button", { class: "btn small danger", type: "button", text: "Revoke", onclick: () => revoke(a) })),
+      ));
+
+      async function changePermission(a, perms) {
+        try {
+          await api.put(`/api/entries/${entry.id}/shares/${a.recipient_id}`, perms);
+          await render();
+        } catch (err) {
+          toast(err.message);
+        }
+      }
+
+      async function revoke(a) {
+        const ok = await dialog({
+          title: `Revoke ${a.username}'s access?`,
+          message: "Future requests from them are refused and the entry's key is replaced for everyone who keeps access. "
+            + "Anything they already viewed or copied cannot be taken back.",
+          confirmLabel: "Revoke",
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          const result = await api.del(`/api/entries/${entry.id}/shares/${a.recipient_id}`);
+          toast("Access revoked");
+          if (result && result.protected_layer_unchanged) {
+            await dialog({ title: "Access revoked", message: result.message, confirmLabel: "OK" });
+          }
+          await render();
+        } catch (err) {
+          toast(err.message);
+        }
+      }
+
+      async function revokeAll() {
+        const ok = await dialog({
+          title: "Revoke everyone?",
+          message: "Nobody else will be able to open this entry. Anything already viewed or copied cannot be taken back.",
+          confirmLabel: "Revoke all",
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          const result = await api.del(`/api/entries/${entry.id}/shares`);
+          toast("All access revoked");
+          if (result && result.protected_layer_unchanged) {
+            await dialog({ title: "Access revoked", message: result.message, confirmLabel: "OK" });
+          }
+          await render();
+        } catch (err) {
+          toast(err.message);
+        }
+      }
+
+      body.replaceChildren(
+        h("h2", { id: "share-title", text: `Share "${entry.name}"` }),
+        h("p", { text: "Choose an account. They receive access to this one entry only, never your vault or your password. Protected entries still need their separate password." }),
+        h("label", { class: "field" }, h("span", { text: "Account" }), select),
+        h("fieldset", { class: "choice" }, h("legend", { text: "Permissions" }),
+          h("label", {}, h("input", { type: "checkbox", checked: true, disabled: true }), "View and copy (always)"),
+          h("label", {}, edit, "Edit credential fields"),
+          h("label", {}, exportBox, "Allow export as .pastry")),
+        error,
+        h("div", { class: "dialog-actions" }, addButton),
+        h("h2", { text: "Who has access" }),
+        data.access.length ? h("div", { class: "panel" }, h("div", { class: "panel-body" }, rows))
+          : h("p", { class: "muted", text: "Nobody else can open this entry." }),
+        data.own_fingerprint ? h("p", { class: "small muted mono", text: `Your key: ${data.own_fingerprint}` }) : null,
+        h("p", { class: "help", text: "Key fingerprints let you confirm out of band that the right key is used. The server you are connected to can still read unlocked entries." }),
+        h("div", { class: "dialog-actions" },
+          data.access.length ? h("button", { class: "btn danger", type: "button", text: "Revoke everyone", onclick: revokeAll }) : null,
+          h("button", { class: "btn", type: "button", text: "Close", onclick: () => dlg.close() })),
+      );
+    }
+
+    dlg.addEventListener("close", () => { dlg.remove(); if (currentRoute()[0] === "entry") route(); });
+    document.body.append(dlg);
+    dlg.showModal();
+    await render();
+  }
+
+  // ----- Shared With Me ------------------------------------------------------------
+
+  async function showSharedList() {
+    const data = await api.get("/api/shared");
+    const rows = data.entries.map((e) => h(
+      "div",
+      { class: "entry-row shared-row" },
+      h("a", { class: "entry-main", href: `#/shared/${e.id}` },
+        h("div", {},
+          h("div", { class: "entry-title" }, h("span", { text: e.name })),
+          h("div", { class: "entry-sub", text: `Shared by ${e.owner}${e.category ? ` · ${e.category}` : ""}` })),
+        h("div", { class: "entry-meta" },
+          e.locked ? h("span", { class: "badge", text: e.unlocked ? "Unlocked" : "Separate password" }) : null,
+          h("span", { class: "badge", text: permissionLabel(e) }))),
+    ));
+    view.replaceChildren(
+      h("div", { class: "view-head" }, h("h1", { text: "Shared With Me" }),
+        h("span", { class: "muted small", text: `${data.entries.length} ${data.entries.length === 1 ? "entry" : "entries"}` })),
+      rows.length ? h("div", { class: "list" }, rows)
+        : h("div", { class: "empty" }, h("h2", { text: "Nothing shared with you yet" }),
+            h("p", { text: "Entries other accounts share with you appear here, with the access they gave you." })),
+    );
+  }
+
   // ----- editor -----------------------------------------------------------
 
   function blankEntry() {
@@ -574,7 +1093,7 @@
   async function showEditor(id) {
     let entry = blankEntry();
     if (id !== null) {
-      entry = await api.get(`/api/entries/${id}`);
+      entry = await api.get(entryApi(id));
       if (entry.locked && !entry.unlocked) {
         view.replaceChildren(
           h(
@@ -585,7 +1104,7 @@
               "div",
               { class: "panel-body" },
               h("p", { class: "muted", text: "This entry has a separate password. Unlock it first, then edit it." }),
-              h("a", { class: "btn", href: `#/entry/${id}`, text: "Back to entry" }),
+              h("a", { class: "btn", href: entryHash(id), text: "Back to entry" }),
             ),
           ),
         );
@@ -720,7 +1239,12 @@
     renderFields();
 
     // Separate password
-    const lockBox = h("input", { type: "checkbox", checked: wasLocked });
+    const lockBox = h("input", { type: "checkbox", checked: wasLocked, disabled: Boolean(entry.shared) });
+    if (entry.shared) {
+      // Category, favourite, protection and sharing stay with the owner; the server enforces this too.
+      categoryInput.disabled = true;
+      favouriteInput.disabled = true;
+    }
     const sepFirst = h("input", { type: "password", autocomplete: "new-password", maxlength: "256", "aria-label": "Separate password" });
     const sepSecond = h("input", { type: "password", autocomplete: "new-password", maxlength: "256", "aria-label": "Repeat separate password" });
     const sepBlock = h(
@@ -737,7 +1261,8 @@
       ? "This entry is protected. Unchecking the box and saving removes the separate password."
       : "When enabled, this entry's contents are encrypted with a second password that the vault password cannot open.";
 
-    const cancelHref = id === null ? "#/" : `#/entry/${id}`;
+    const cancelHref = id === null ? "#/" : entryHash(id);
+    const sharedEdit = Boolean(entry.shared);
     const form = h(
       "form",
       { class: "editor", novalidate: true },
@@ -827,11 +1352,11 @@
           toast(lockOn ? "Saved. Enter the separate password to view it." : "Entry saved");
           location.hash = `#/entry/${created.id}`;
         } else {
-          await api.put(`/api/entries/${id}`, payload);
-          if (lockOn && !wasLocked) await api.post(`/api/entries/${id}/protect/enable`, { password: sepFirst.value });
-          if (!lockOn && wasLocked) await api.post(`/api/entries/${id}/protect/remove`);
+          await api.put(entryApi(id), payload);
+          if (!sharedEdit && lockOn && !wasLocked) await api.post(`/api/entries/${id}/protect/enable`, { password: sepFirst.value });
+          if (!sharedEdit && !lockOn && wasLocked) await api.post(`/api/entries/${id}/protect/remove`);
           toast("Entry saved");
-          location.hash = `#/entry/${id}`;
+          location.hash = entryHash(id);
         }
       } catch (err) {
         if (err.status !== 401) fail(err.message);
@@ -1155,6 +1680,9 @@
 
   function boot() {
     applyTheme(savedTheme());
+    if (document.body.dataset.role !== "owner") {
+      document.querySelectorAll("[data-owner-only]").forEach((link) => { link.hidden = true; });
+    }
     document.getElementById("menu-btn").addEventListener("click", () => {
       setNavOpen(!shell.classList.contains("nav-open"));
     });

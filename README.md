@@ -43,7 +43,7 @@ Pastry/
 │   └── static/                app.css, app.js
 ├── SECURITY-REVIEW.md         threat model, crypto design, audit findings (v1.1)
 └── DEPLOYMENT.md              install, upgrade from v1.0, Tailscale, Caddy, systemd
-└── tests/                     pytest suite (126 tests), frozen v1 fixture in fixtures/v1
+└── tests/                     pytest suite (344 tests), frozen v1 fixture in fixtures/v1
 ```
 
 ---
@@ -400,7 +400,7 @@ Run the suite:
 .venv/bin/python -m pytest -q
 ```
 
-**Result: 126 passed.** The original 72 tests still pass, and v1.1 adds 54 more (migration, throttling, sessions, password change, re-lock, backup v2). Coverage by requirement:
+**Result: 192 passed.** (126 from v1.1, plus 66 for packages, the viewer, export and terminal tests.) The original 72 tests still pass, and v1.1 adds 54 more (migration, throttling, sessions, password change, re-lock, backup v2). Coverage by requirement:
 
 | Requirement | Tests |
 |---|---|
@@ -458,3 +458,82 @@ Please read these before relying on Pastry for anything important.
 ## Licence and use
 
 Personal project. Use it at your own risk, and keep a tested backup before you move any real credentials into it.
+
+---
+
+## 12. Secure packages (`.pastry`), v1.2 branch
+
+Export selected entries as an encrypted file, then open it in a terminal.
+
+**Export.** Tick entries in the list, then press *Export as Pastry*. Choose a package name, a package password (12 or more characters; use *Generate*), whether the viewer may copy values, and an advisory expiry. Protected entries must be unlocked first. The file is downloaded directly and is never stored on the server.
+
+**Open (recipient).** Put the `.pastry` file in a folder and run:
+
+```bash
+pastry              # picker: lists .pastry files in the current folder only
+pastry open server-access.pastry
+pastry inspect server-access.pastry     # metadata only, no decryption
+```
+
+Keys in the viewer: Up/Down move, Enter opens, R reveals or hides secrets, C copies (only if the sender allowed it), Tab moves to the next field, Esc goes back, Q quits.
+
+**Limits you must understand.** Expiry is advisory and is enforced only by this viewer. Copying can be disabled in the viewer but cannot be prevented in general. Anyone with the file and its password can read it at any time. Timed and one-time packages that need a release server are **not implemented**. See `docs/CRYPTOGRAPHY-V12.md` and `SECURITY-REVIEW.md` section 11.
+
+**Recipient installation** (base dependencies only, no server):
+
+```bash
+pipx install ./pastry_password_server-1.1.0-py3-none-any.whl
+pastry --version
+pipx upgrade pastry-password-server          # after installing a newer wheel
+pipx uninstall pastry-password-server
+```
+
+Build the wheel from the repository with `pip wheel . --no-deps -w dist/`. Copy-to-clipboard needs one of `xclip`, `xsel`, `wl-clipboard` (Linux) or `pbcopy` (macOS).
+
+**Multi-user accounts and entry sharing are not in this branch.** `pastry admin create-user` refuses, and there is no sharing feature.
+
+---
+
+## 13. Timed packages (server-enforced), branch `feature/v1.2-secure-sharing`
+
+Set `public_url` in `config/pastry.json` (see DEPLOYMENT.md section I), then choose an access type in the export dialog:
+
+- **Expires after opening:** 5 minutes, 15 minutes, 1 hour or 24 hours, counted from the first successful release on the server.
+- **Absolute deadline:** up to 30 days from creation.
+- **One-time:** the first successful release consumes the package.
+
+Manual revocation is always available on the **Packages** page, and so is deletion. Revocation and expiry are enforced by the server clock. The file alone, with its password, cannot be opened: the server must release the key.
+
+Recipients run `pastry open FILE.pastry`. The viewer asks them to confirm the server host, then checks the server every 30 seconds and closes the secrets if the package expires, is revoked, or the server stops answering.
+
+**Important limits.** A recipient who has already opened a package may keep what they saw, and the key they were given. Revocation cannot undo that. Timed packages cannot be opened when the server is unreachable. See `SECURITY-REVIEW.md` section 12 and `docs/CRYPTOGRAPHY-V12.md` section 10. The design has had only a self-review.
+
+---
+
+## 14. Multi-user accounts and entry sharing (1.2.0rc1)
+
+**Accounts.** The owner is created by `pastry setup`. Other people get an account through an invitation:
+
+```bash
+.venv/bin/pastry admin create-user          # prompts for a username and prints an invitation link
+.venv/bin/pastry admin list-users           # accounts, status, pending invitations
+.venv/bin/pastry admin disable-user alice   # ends alice's sessions; her encrypted data is kept
+```
+
+An invitation works once and expires after 72 hours. The invitee chooses their own master password, and the owner never sees it. Each account has its own encrypted vault, and the owner cannot read another account's entries. A forgotten master password cannot be recovered by anyone.
+
+**Sharing one entry.** Open an entry you own and press **Share**. Choose an account and permissions:
+
+- **View** (always): read and copy the credentials.
+- **Edit**: change the name, URL and credential content.
+- **Export**: package the entry as `.pastry`. Off unless granted.
+
+Only the entry's owner can share, change permissions or revoke. **Manage Access** is in the same dialog. The recipient finds the entry under **Shared With Me**. A recipient must have signed in once before they can receive a share.
+
+**Revoking.** Access ends on the recipient's next request, and the entry's key is replaced for everyone who keeps access. Anything the person already saw or copied cannot be recalled. An entry with a separate password stays protected by that password: if the person knew it, change it after revoking.
+
+**Protected entries.** Sharing never removes "Require Separate Password". A recipient needs the sharing grant and the separate password, which you give them yourself.
+
+**Upgrading.** The first owner sign-in after the upgrade takes a verified backup and migrates the database. Each account's older entries are converted to per-entry keys at that account's next sign-in. `pastry migrate` does the schema step from the command line.
+
+**Trust model.** Pastry decrypts on the server. It is not end-to-end encrypted, and a compromised server can read open vaults and substitute sharing keys. See `docs/MULTIUSER-CRYPTO.md` and `SECURITY-REVIEW.md` section 14.

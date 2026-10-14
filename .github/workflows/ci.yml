@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, "feature/**"]
+
+# Least privilege: the workflow can read the repository and nothing else.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests and lint (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt pyflakes
+          pip install -e . --no-deps
+      - name: Lint
+        run: |
+          python -m pyflakes pastry tests
+          node --check pastry/static/app.js
+      - name: Database migration tests
+        run: python -m pytest -q tests/test_migration.py tests/test_multiuser_migration.py
+      - name: Package format and compatibility tests
+        run: python -m pytest -q tests/test_package.py tests/test_release.py tests/test_export_api.py
+      - name: CLI and terminal viewer tests
+        run: python -m pytest -q tests/test_setup_admin.py tests/test_admin_commands.py tests/test_viewer.py tests/test_tui_pty.py tests/test_tui_server_pty.py
+      - name: Full test suite
+        run: python -m pytest -q
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit pinned runtime dependencies
+        run: |
+          python -m pip install --upgrade pip pip-audit
+          pip-audit -r requirements.txt
+      - name: Check that no secrets or data files are tracked
+        run: |
+          if git ls-files | grep -E '(^|/)(auth\.json|release\.key|\.env)$|\.pastry$|\.db$' | grep -v '^tests/fixtures/v1/'; then
+            echo "sensitive-looking file is tracked" >&2
+            exit 1
+          fi
+
+  build:
+    name: Build and install the recipient CLI from a clean environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify the wheel
+        run: scripts/verify-wheel.sh

@@ -26,6 +26,7 @@ ALLOWED_OVERRIDES = {
     "login_lockout_minutes",
     "entry_max_failures",
     "entry_lockout_minutes",
+    "public_url",
 }
 
 
@@ -51,6 +52,9 @@ class Settings:
     login_lockout_minutes: int = 15
     entry_max_failures: int = 5
     entry_lockout_minutes: int = 10
+    # HTTPS address recipients use to reach this server (for example Tailscale Serve).
+    # Written into server-enforced package headers. Never guessed from the Host header.
+    public_url: str = ""
     kdf: KdfParams = field(default_factory=KdfParams)
 
     @property
@@ -68,6 +72,10 @@ class Settings:
     @property
     def db_path(self) -> Path:
         return self.data_dir / "pastry.db"
+
+    @property
+    def release_key_path(self) -> Path:
+        return self.config_dir / "release.key"
 
     @property
     def backup_dir(self) -> Path:

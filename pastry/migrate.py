@@ -17,7 +17,7 @@ import json
 from typing import Callable
 
 from . import crypto
-from .db import SCHEMA_VERSION, Store
+from .db import ACCOUNT_STATEMENTS, PACKAGE_STATEMENTS, SCHEMA_VERSION, SHARING_STATEMENTS, Store
 from .vault import META_AAD_PREFIX
 
 V1_META_PREFIX = b"pastry:meta:"
@@ -95,10 +95,102 @@ def migrate_v1_to_v2(
         conn.execute(
             "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (str(SCHEMA_VERSION),),
+            ("2",),  # this step produces schema v2 exactly; v2 -> v3 is migrate_v2_to_v3
         )
         conn.execute(
             "CREATE TABLE IF NOT EXISTS rate_limits (key TEXT PRIMARY KEY, failures TEXT NOT NULL, "
             "blocked_until REAL NOT NULL DEFAULT 0)"
         )
+    # The old table's pages are now free. Rebuild the file so none of its plaintext (timestamps,
+    # lock state) remains anywhere in it, whatever the SQLite build does with freed pages.
+    with store.connect() as conn:
+        conn.execute("VACUUM")
     return len(rows)
+
+
+def migrate_v2_to_v3(store: Store) -> None:
+    """Additive: add the package and nonce tables. No existing data is touched.
+
+    Needs no password: nothing is re-encrypted. Runs in one transaction.
+    """
+    if store.schema_version() != 2:
+        raise MigrationError("The database is not schema v2; nothing to migrate.")
+    with store.transaction() as conn:
+        for statement in PACKAGE_STATEMENTS:
+            conn.execute(statement)
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("3",)  # this step produces v3 exactly,
+        )
+
+
+def migrate_v3_to_v4(store: Store) -> dict:
+    """Additive, no password needed. Adds per-account ownership without touching any blob.
+
+    - entries.owner_id (default 0: every existing entry belongs to the owner)
+    - users and invitations tables
+    - packages.owner becomes the owner's account id "0" (it was the owner's username)
+
+    One transaction. Verified before commit: counts unchanged, every package owned by "0",
+    SQLite integrity check passes. Any failure rolls everything back.
+    """
+    if store.schema_version() != 3:
+        raise MigrationError("The database is not schema v3; nothing to migrate.")
+    with store.transaction() as conn:
+        entries_before = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        packages_before = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+        conn.execute("ALTER TABLE entries ADD COLUMN owner_id INTEGER NOT NULL DEFAULT 0")
+        for statement in ACCOUNT_STATEMENTS:
+            conn.execute(statement)
+        conn.execute("UPDATE packages SET owner = '0'")
+        entries_after = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        packages_after = conn.execute("SELECT COUNT(*) FROM packages").fetchone()[0]
+        if entries_after != entries_before or packages_after != packages_before:
+            raise MigrationError("verification failed: row counts changed")
+        wrong = conn.execute("SELECT COUNT(*) FROM packages WHERE owner != '0'").fetchone()[0]
+        if wrong:
+            raise MigrationError("verification failed: package ownership")
+        non_owner = conn.execute("SELECT COUNT(*) FROM entries WHERE owner_id != 0").fetchone()[0]
+        if non_owner:
+            raise MigrationError("verification failed: entry ownership")
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise MigrationError("verification failed: integrity check")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("4",)  # this step produces v4 exactly,
+        )
+    return {"entries": entries_after, "packages": packages_after}
+
+
+def migrate_v4_to_v5(store: Store) -> dict:
+    """Additive, no password needed: per-entry key columns, account key pairs and shares tables.
+
+    Existing entries stay in format 4 (sealed under the account key) and keep working. Each account's
+    entries are upgraded to per-entry keys the next time that account signs in (see vault.upgrade_entries),
+    because only that account's session holds its vault key. One transaction, verified before commit.
+    """
+    if store.schema_version() != 4:
+        raise MigrationError("The database is not schema v4; nothing to migrate.")
+    with store.transaction() as conn:
+        before = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        conn.execute("ALTER TABLE entries ADD COLUMN fmt INTEGER NOT NULL DEFAULT 4")
+        conn.execute("ALTER TABLE entries ADD COLUMN key_blob BLOB")
+        conn.execute("ALTER TABLE entries ADD COLUMN key_version INTEGER NOT NULL DEFAULT 0")
+        for statement in SHARING_STATEMENTS:
+            conn.execute(statement)
+        after = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+        if after != before:
+            raise MigrationError("verification failed: row counts changed")
+        if conn.execute("SELECT COUNT(*) FROM entries WHERE fmt != 4").fetchone()[0]:
+            raise MigrationError("verification failed: entry format")
+        if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+            raise MigrationError("verification failed: integrity check")
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+    return {"entries": after}

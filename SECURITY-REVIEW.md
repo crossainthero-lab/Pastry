@@ -143,7 +143,7 @@ Consequences that follow from single-user operation:
 
 ## 9. Tests
 
-The suite has 126 tests. The 72 v1 tests still pass. The new modules are:
+The suite has 192 tests. The 126 from v1.1 still pass. The new modules are:
 
 - `test_migration.py`: migration of the frozen v1 fixture, preserved separate-password locks, rollback after an injected failure, backup before migration, wrong-password refusal, server and `start` refusing an unmigrated vault.
 - `test_v11_security.py`: persistent throttling across restart, spoofed forwarded headers, session listing and revocation, password change through the API, idle re-lock, encrypted timestamps, nonce uniqueness, ciphertext swapping between entries, XSS data handling, anonymous access to every route, atomic auth-file replacement.
@@ -164,3 +164,224 @@ Run with `.venv/bin/python -m pytest -q`. The result at the time of writing is i
 4. The Tailscale and Caddy deployment paths were documented but not exercised here, because no tailnet or LAN was available.
 5. Python cannot guarantee key erasure.
 6. No independent review has been done. Security-sensitive code, especially the migration and backup paths, should be reviewed before depending on it.
+
+---
+
+## 11. v1.2 branch: what was added, and what is still missing
+
+Branch: `feature/v1.2-secure-sharing`. Version in code is still 1.1.0, because most of the v1.2 scope is not implemented. The version will move to 1.2.0 only when multi-user, sharing and server-enforced packages are done.
+
+### Implemented on the branch
+
+- **Offline `.pastry` packages** (format version 1, documented in `docs/CRYPTOGRAPHY-V12.md`). Random per-package DEK, Argon2id-derived KEK from the package password, AES-256-GCM envelope, authenticated plaintext header, bounded sizes and KDF parameters. Keys are independent of the vault.
+- **Export as Pastry** (web UI and `POST /api/packages/export`). Exports only the selected entries. Protected entries require their separate password first, enforced on the server. Timed and one-time modes return HTTP 501. No plaintext export is written to disk.
+- **Terminal viewer** (`pastry`, `pastry open`, `pastry inspect`). Standard-library curses, masked password entry, masked secrets revealed with R, optional copy with clipboard clearing only when the value is unchanged, expiry check every half second, optional deletion of the exact opened file on expiry.
+- **Recipient install without the server stack.** Base dependencies are `argon2-cffi` and `cryptography`. FastAPI and uvicorn are in the `server` extra. Verified in a clean venv: `pastry inspect` and `pastry open` work, and `pastry start` fails with a clear message.
+
+### Not implemented (disabled or refused, not faked)
+
+- **Multi-user accounts and per-user key hierarchy.** `admin create-user` and `disable-user` refuse. No second account can exist.
+- **Entry sharing (X25519 envelope wrapping, view and edit permissions, revocation).** No sharing routes or UI exist.
+- **Server-enforced expiring packages (Mode B).** No release secret, no key-release protocol, no redemption counter, no server-side revocation. Timed and one-time packages are refused.
+- **Packages management UI** (listing, revoke, delete). Packages are not recorded server-side, so there is nothing to revoke.
+- **Users page, Shared With Me page, Manage Access page.** Not built.
+- **Separate standalone recipient distribution.** The recipient wheel is the same project wheel with the server code inside but inert unless the server extra is installed. A truly separate distribution was not built.
+
+### New risks introduced by v1.2
+
+| Risk | Detail | Mitigation |
+|---|---|---|
+| Offline guessing of package passwords | Anyone with the file can attempt passwords offline. Each guess costs one Argon2id derivation (64 MiB). | Passwords under 12 characters are refused. The generator produces 16 to 48 characters. Nothing else can limit offline guessing. |
+| Advisory expiry is bypassable | A modified viewer or a copy of the file ignores `expires_at`. | Stated in the UI and docs. Not a security control. |
+| Copy setting is not DRM | Terminal selection, screenshots and transcription still work. | Stated in the UI and docs. |
+| Clipboard contents | Copied values stay on the clipboard until cleared. The clear is best effort and runs only while the viewer process is alive. | Clear after 30 seconds by default, only if unchanged. |
+| Terminal scrollback | Revealed values may stay in terminal history. The viewer draws with curses, which does not write to scrollback, but the terminal emulator may keep its own history. | Documented. |
+| Package names are plaintext | The label is in the authenticated header. | Documented. Use neutral labels. |
+| File-size and cost limits | Hostile files cannot force large memory use because KDF parameters are bounded, and file size, header size, entry count and field sizes are capped. | Tested. |
+| Python memory retention | Keys and decrypted values are best-effort wiped. | Documented. |
+
+### Verification performed
+
+- Pytest: 192 passed (126 pre-existing, plus 66 for packages, viewer, export API and pseudo-terminal tests).
+- Pseudo-terminal tests drive the real viewer with pexpect: picker, masked password, wrong password, copy disabled, empty directory, `open`, `inspect`.
+- Browser test (headless Chrome): select two entries, export with copy disabled, download the file, and decrypt it with the package password. The result contains exactly the two entries.
+- Earlier browser passes re-run against the new UI, with no regressions.
+
+### Items that still need independent review before any trust
+
+The package envelope, the header binding and the bounds checks are small, but they are new cryptographic code written here. They need a review by someone who does cryptographic engineering before anyone relies on them for real secrets.
+
+---
+
+## 12. Server-enforced (timed) packages: implementation status and review
+
+**Review status: self-review only. Not independently reviewed. Do not treat the design or the code as reviewed.** The design is in `docs/CRYPTOGRAPHY-V12.md` section 10, which supersedes the "not implemented" statements in sections 7 and 11 above.
+
+### 12.1 What is implemented
+
+- Schema v3 adds `packages` and `release_nonces`. `pastry migrate` upgrades v2 vaults additively, without touching existing rows.
+- Export modes: **after opening** (5 minutes, 15 minutes, 1 hour, 24 hours, measured from the first successful release), **absolute deadline** (up to 30 days from creation), and **one-time** (the first successful release consumes the package). Manual revocation is available at any time. Timed modes need `public_url` in the server configuration, and they are refused without it.
+- The release protocol (status, challenge, redeem) is served under `/release/v1/` on the same app. It never reads vault entries, sessions or the vault key.
+- The recipient viewer (`pastry open`) contacts the server over HTTPS with default certificate verification. It asks for confirmation before sending anything. It polls the server every 30 seconds and fails closed after two failed checks.
+- Owner package API: create, list, download the stored encrypted copy, revoke, delete. Every query is scoped to the owner.
+- The Packages page shows name, creation time, expiry, policy, status and entry count.
+- Startup erases the release material of packages past their deadline. Listing packages does the same.
+
+### 12.2 Verification performed
+
+| Area | Tests |
+|---|---|
+| Release state machine (expiry, windows, absolute deadlines, one-time, revocation, deletion, nonce single use, nonce expiry, proof binding, cross-package nonce reuse, sweep, missing release key) | `tests/test_release.py` (24) |
+| Owner and public HTTP routes (creation validation, listing without capabilities, download, release over HTTP, rate limits, lockouts, forwarded-header independence, malformed requests, cross-owner ID manipulation, CSRF, anonymous access, expired sessions) | `tests/test_release_api.py` (21) |
+| Real sockets: full release, plain HTTP refused for remote hosts, no silent downgrade to HTTP, **self-signed certificate rejected by default**, accepted only when explicitly trusted, unreachable server reported, six concurrent network redemptions of one one-time package release exactly once | `tests/test_release_network.py` (7) |
+| Real `pastry open` in a pseudo-terminal against a live server: release and reveal, decline sends nothing, wrong password, revoked package, unreachable server with no offline fallback, expiry measured on the server clock closes the viewer, delete-on-expiry removes only the opened file | `tests/test_tui_server_pty.py` (7) |
+| Offline package format and TUI behaviour, unchanged | the 192 earlier tests |
+
+Browser check (headless Chrome, against the live scratch server): an after-opening package was created through the export dialog, listed on the Packages page, and then opened with the real `pastry open` command. The secret was masked until R was pressed. Three earlier browser passes still pass.
+
+### 12.3 What the tests do not establish
+
+- **Tailscale.** No tailnet exists on this machine, so `tailscale serve` was never run. The HTTPS path is exercised only through a self-signed local certificate and the trust-store override.
+- **Real expiry over the wire.** The expiry tests use a simulated clock shared by the server thread and the viewer. Real time was not waited on.
+- **Pexpect and threads.** The pseudo-terminal tests run while server threads exist. Python can warn that `fork` is unsafe in a multi-threaded process. This affects only the test harness.
+- **Raspberry Pi and older Ubuntu.** Not measured.
+- **Independent cryptographic review.** Not performed.
+
+### 12.4 Remaining risks (in addition to sections 7 and 11)
+
+| Risk | Detail | Mitigation |
+|---|---|---|
+| Keys already released stay usable | A recipient who has obtained `K_r` can keep the file and `K_r` and decrypt indefinitely. Expiry stops only future releases. | Stated in the UI and in `docs/CRYPTOGRAPHY-V12.md` 10.8. |
+| Key material in recipient memory | After release, `K_r` exists as Python `bytes` copies (`bytes(k_r)` for the opener), which `wipe` cannot clear. The viewer does not write it to disk. | Best effort. The release key lives in process memory long enough to decrypt the payload. |
+| Stolen database and `release.key` together | `K_auth` allows offline guessing of the package password, and then `K_r` is obtainable. | Keep `config/release.key` out of backups (done). Restrict file permissions (done). |
+| Backups and restores | `pastry backup` excludes `release.key`. A restore on a machine without that key leaves timed packages unreleasable, which is the intended safe failure. | Documented in DEPLOYMENT.md. |
+| Malicious package names a different server | The viewer shows the host and requires confirmation. A host the user confirms receives an offline-guessable proof. | The user must check the host. |
+| Sender's server sees the package password | At creation, the password reaches the server in memory to derive `K_pw` and `K_auth`. It is not stored. | Accepted, because the sender runs the server. |
+| At-most-once delivery for one-time packages | If the server commits a one-time release but the response is lost in transit, the package is consumed and the recipient gets nothing. | Documented. The alternative (release without consuming) would break the one-time guarantee. |
+| Shared rate-limit address behind Tailscale Serve | Requests arrive from the same local address, so the request-volume limit is shared among clients. The per-capability failure limit is the one that protects a package. | Documented. |
+| Offline guessing of the package password from the file | None. The file has no password-verifiable ciphertext for server packages. For offline packages (unchanged) guessing is possible at Argon2id cost. | Documented in section 10.7 of the design. |
+| Argon2id parameters | Fixed in code. | Documented. |
+| Pexpect and threads warning | Test harness only. | None needed in production. |
+
+### 12.5 Open items before any release decision
+
+1. Independent review of `docs/CRYPTOGRAPHY-V12.md` section 10 and of `pastry/release.py`, `pastry/release_client.py` and the release routes in `pastry/web.py`.
+2. A real Tailscale Serve test on the target machine, with a second device.
+3. Measurement on Raspberry Pi-class hardware.
+4. The Packages page and the release protocol still need a browser run against a Tailscale HTTPS address.
+
+---
+
+## 13. Multi-user accounts (v1.2 branch): implementation status and review
+
+**Review status: self-review only. Not independently reviewed.** The architecture is in `docs/MULTIUSER-CRYPTO.md`.
+
+### 13.1 Implemented
+
+- **Accounts.** The owner stays in `config/auth.json`. Other accounts are in the `users` table. Each has its own Argon2id salt, password verifier and random 256-bit vault key, wrapped under a KEK derived from that account's password. No account can derive another's key. The owner cannot decrypt another account's entries, and role checks on the server enforce this at the route level.
+- **Invitations.** Created by the owner, single-use, expire after 72 hours, and stored only as a SHA-256 hash. The invitee chooses their own master password. The server generates their vault key. Usernames are unique across the owner and all accounts, case-insensitively.
+- **CLI.** `pastry admin create-user` prints an invitation link. `pastry admin list-users` shows accounts and pending invitations. `pastry admin disable-user USERNAME` disables an account and ends its sessions. The owner cannot be disabled.
+- **Web.** A Users page for the owner. Invite and disable actions are owner-only on the server. A public invitation page. Users see Shared With Me, which states that sharing is off.
+- **Migration.** Schema v4 is additive and needs no password. It adds `entries.owner_id` (default 0, the owner), the `users` and `invitations` tables, and rewrites package ownership to account ID `"0"`. It runs in one transaction with verification before commit. The owner's first sign-in after an upgrade takes a verified backup and then migrates. `pastry migrate` does the same from the command line.
+- **Session isolation.** Each account has its own session epoch. A password change, or disabling, invalidates only that account's sessions. The owner's password change no longer signs out other accounts.
+- **Packages.** Scoped by account ID. A timed package made before the upgrade still releases afterwards (tested).
+
+### 13.2 Not implemented
+
+- **Entry sharing.** Disabled. Every sharing endpoint returns HTTP 501, and no Share button exists. The reasons are in `docs/MULTIUSER-CRYPTO.md` section 7: recipient key verification (fingerprints compared out of band) is not built, per-entry keys are not built, and revocation with key rotation is not built. Sharing needs all three before it can be enabled safely.
+- **Administrative password reset.** Not offered. A forgotten master password means that vault is lost. This is deliberate.
+- **Export of shared entries.** Not applicable while sharing is disabled.
+
+### 13.3 Verification
+
+- `tests/test_multiuser.py`: three accounts (owner, alice, bob) over HTTP. Covers vault separation, search, ID manipulation on every entry route, locked entries, exports, packages, role checks, the disabled sharing endpoints, invitations (single-use, expiry, unknown tokens, case-insensitive uniqueness, the hash-only token), disabling and its effect on sessions, password changes that keep entries, invalid key wrapping failing closed, generic login errors, session isolation and per-session CSRF.
+- `tests/test_multiuser_migration.py`: automatic owner migration at sign-in, backup written and verified first, an interrupted migration rolling back byte-for-byte and refusing sign-in, retry after failure, non-owner sign-in refused before migration, a timed package from before the upgrade still releasing, package ownership rewritten, backup and restore preserving accounts and their entries, and the release key excluded from backups.
+- `tests/test_admin_commands.py`: CLI commands.
+- Headless browser: an owner creates an invitation, the invitee opens it in a separate browser profile, sets a password and signs in, sees the sharing notice, and creates an entry. The owner does not see that entry, and disables the account. The invitee's next request sends them to sign-in.
+- The earlier browser passes still work.
+
+### 13.4 Limitations specific to this version
+
+- **Server-side decryption.** The server holds an account's key while that account's session is open. An operator with code access to the server can read any open vault and any password typed into it. This is not end-to-end encryption.
+- **Invitation links are bearer secrets.** Anyone who sees a link before its recipient can register that username until it is used or expires.
+- **Disabled accounts keep their data.** Their encrypted vaults stay on the server until someone removes the account, and no removal command exists yet.
+- **Owner recovery.** The owner's own password is recovered only from the backup and the password itself, as before.
+
+---
+
+## 14. v1.2 release candidate: entry sharing, review process and release gates
+
+Version: `1.2.0rc1` (release candidate). **Not released, not merged, and not independently audited.**
+
+### 14.1 What was reviewed, and by whom
+
+| Review | What it is | What it is not |
+|---|---|---|
+| Self-review by the developer (an AI model) during implementation | Design checks, adversarial tests written by the same author, and a route inventory | Independent |
+| One adversarial review by a separate AI agent with no prior context, given the code and the threat model | A fresh read of `sharing_crypto.py`, `account_keys.py`, the sharing parts of `vault.py` and `web.py`, and the migrations. It reported seven findings and listed what it found sound. | A human cryptographer, a paid audit, or a formal verification |
+| `pip-audit` on the pinned runtime dependencies | Found 25 known vulnerabilities in two pins | A review of Pastry's own code |
+
+**An independent human security review has not happened. It is the remaining release gate.**
+
+### 14.2 Findings of the separate AI review, reconciled
+
+Each claim was checked against the code before action.
+
+| # | Severity | Finding | Verdict | Disposition |
+|---|---|---|---|---|
+| 1 | Medium | A stale separate-password key cached in a session could seal new content after the password was changed from another session, making the entry unreadable (data loss, or deliberate sabotage by an editor who knew the old password). | Confirmed | **Fixed.** The cached key must open the stored content inside the write transaction (409 otherwise) and is dropped. Regression tests fail without the fix. |
+| 2 | Medium/Low | Revoking a protected entry does not re-key its separate-password layer, so a revoked recipient who knew that password could still open any ciphertext copy they hold (for example a package export). | Confirmed; already stated in the design | **Mitigated, not eliminated.** The API now returns an explicit warning and the interface shows it. Changing the separate password re-keys the layer. A forced re-key at revocation was not implemented. |
+| 3 | Low | The unlock-attempt limiter was shared between an entry's owner and its recipients, so a recipient could lock the owner out, and a success by one account reset the other's counter. | Confirmed | **Fixed.** Limits are per account and entry, with a ceiling across accounts, and a success resets only that account's counter. |
+| 4 | Low | After a restore onto a machine with a different `release.key`, revoking a single recipient fails until keys are re-bound. | Confirmed; fail-closed by design | **Mitigated.** The error names `pastry admin rebind-keys` and the revoke-everyone fallback. |
+| 5 | Low | The directory endpoint and the "has not generated a sharing key" message let any signed-in account enumerate accounts and see whether they have signed in. | Confirmed | **Accepted** for a household or team deployment, and documented. No keys or entries are listed. |
+| 6 | Low | A cached separate-password key survived a revoke and re-share, giving instant access without re-entering the password. | Confirmed | **Fixed.** Revoking and sharing drop the recipient's cached key for the entry in every session. |
+| 7 | Low | Protection changes read the row outside the transaction, so a concurrent edit could be overwritten. | Confirmed | **Fixed.** Read, transform and write run in one transaction. |
+
+The reviewer reported no authorization bypass, no envelope or key-derivation flaw, and no data loss in the migration.
+
+### 14.3 Dependency vulnerabilities found and fixed
+
+`pip-audit` reported 25 known vulnerabilities: `cryptography` 46.0.3 (7 advisories, fixed in 50.0.0) and `python-multipart` 0.0.20 (6 advisories, fixed in 0.0.31). Both are now pinned at `cryptography==50.0.2` and `python-multipart==0.0.32`, and `pyproject.toml` sets minimum versions at the first fixed releases. The audit now reports no known vulnerabilities, and CI repeats it on every pull request.
+
+### 14.3b Plaintext left in free pages after migration (found by running on a second SQLite build)
+
+Running the suite on a Python build with a different SQLite showed that, after a v1 to v2 migration, the old `entries` table's pages sat on SQLite's free list **with their plaintext timestamps and lock state intact**. Some builds zero freed pages and some do not, so the migration's promise to remove plaintext metadata held only on some machines. This was a real data-at-rest defect in the v1.1 migration, and it would also have left deleted rows' content in the file.
+
+**Fixed:** every connection now sets `PRAGMA secure_delete = ON`, and the v1 to v2 migration runs `VACUUM` after the table swap. The migration test that asserts no plaintext timestamps remain in the file now passes on Python 3.10, 3.12, 3.13 and 3.14.
+
+**Not covered:** a database file that was migrated by an earlier build may still contain plaintext in free pages. Run `sqlite3 data/pastry.db VACUUM` (with the server stopped) once to remove it, or use a fresh backup restore. Filesystem snapshots and previous backups taken before the migration are outside Pastry's control.
+
+### 14.4 Cryptographic design of sharing
+
+See `docs/MULTIUSER-CRYPTO.md` section 7. In short: a random key per entry; the entry key is wrapped to each recipient's X25519 key (ephemeral-static agreement, HKDF-SHA256, AES-256-GCM) with the entry, owner, recipient and key version as authenticated context; public keys carry a MAC derived from a server secret; revocation re-keys the entry in one transaction.
+
+**Trust model.** Decryption is server-side. A malicious or compromised server can substitute public keys, wrap to its own, and read any unlocked entry. Pastry makes no end-to-end encryption claim and no malicious-server resistance claim.
+
+### 14.5 Tests
+
+- 344 passing, 0 failing, lint clean, on Python 3.10, 3.12, 3.13 and 3.14 (run locally with `uv`; GitHub Actions could not start because of an account billing limit, see 14.7).
+- Sharing: owner, alice and bob over HTTP routes. Permission boundaries, ID manipulation, key rotation with replayed old envelopes, tampered public keys, malformed envelopes, envelope move attempts, protected entries, concurrency, and the 12-step workflow including an exported package opened in the terminal viewer against a live server and expiry closing it.
+- Route inventory: every route that is not on a documented public list refuses anonymous callers, and every state-changing API route refuses a valid session without a CSRF token.
+- Migration: entry-format upgrade (IDs, owners, timestamps and separate-password content preserved, byte-identical for protected content), interrupted upgrade, interrupted schema migration, retry.
+- Backups: shares and key envelopes preserved on restore, authenticity MAC, forged-checksum archives refused, restore without the release key.
+- Browser (headless Chrome): invitation and first sign-in, share, edit by the recipient, revocation, immediate refusal.
+
+### 14.6 Remaining risks and limitations
+
+1. **No independent human review.** The main release gate.
+2. **Server-side decryption.** Operators and compromised servers can read open vaults and substitute keys.
+3. **Revocation cannot recall** what a recipient already saw, copied or exported. Protected entries need their separate password changed to re-key that layer.
+4. **Public-key binding depends on `config/release.key`.** Losing it (or restoring elsewhere) makes sharing fail closed until keys are re-bound after comparing fingerprints.
+5. **Backup authenticity is relative to the same server secret.** It proves the archive came from a holder of that key, not from any particular person. Archives from machines without a release key carry no MAC, and checksums alone prove nothing about origin.
+6. **Account enumeration** among signed-in accounts (see finding 5).
+7. **Ownership is not transferable,** and a disabled account's data stays until removed (no removal command exists).
+8. **Timed packages** remain bypassable by anyone who already obtained a release key.
+9. **GitHub Actions** pin actions by major version tags, not by commit SHA.
+10. **The terminal viewer** cannot erase memory or terminal scrollback reliably.
+
+### 14.7 Release gates still open
+
+- Independent human security review of sharing, migration and package release.
+- Live Tailscale test with a second device.
+- Raspberry Pi performance measurement.
+- **GitHub Actions has not run.** Every job was refused with "recent account payments have failed or your spending limit needs to be increased". The workflow file is syntactically valid and the same steps were run locally (lint, the full suite on four Python versions, `pip-audit`, the tracked-file check, and `scripts/verify-wheel.sh`). The account's Billing settings need attention before CI can run.

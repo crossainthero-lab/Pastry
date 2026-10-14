@@ -227,3 +227,114 @@ If the unit is already installed from v1.0, rerun `./install.sh --systemd`, whic
 | `allowed_origins` | `[]` | Usually empty |
 
 Unknown keys are rejected at startup.
+
+---
+
+## H. Recipient viewer (no server)
+
+Recipients need only the viewer. They do not need the server source, the sender's repository, or any server configuration.
+
+```bash
+pip wheel . --no-deps -w dist/          # run by the sender, from the repository
+pipx install dist/pastry_password_server-1.1.0-py3-none-any.whl
+```
+
+Upgrade with `pipx upgrade pastry-password-server` after installing a newer wheel. Uninstall with `pipx uninstall pastry-password-server`. Clipboard support needs `xclip`, `xsel` or `wl-clipboard` on Linux.
+
+**Time-limited sharing through the Tailscale release service is not implemented in this version.** The Tailscale access note for a release service applies only once that service exists. Until then, use offline packages and share the password through a different channel.
+
+---
+
+## I. Timed (server-enforced) packages over Tailscale
+
+Timed packages need the recipient's viewer to reach this server while the package is valid. The release protocol runs on the same port as the web interface, so the same Tailscale address serves both.
+
+**Requirements**
+
+1. Pastry runs on this machine, bound to `127.0.0.1:8787`, as in section C.
+2. `config/pastry.json` contains the HTTPS address recipients will use, and that name is in `allowed_hosts`:
+
+   ```json
+   {
+     "public_url": "https://machine-name.tailnet-name.ts.net",
+     "allowed_hosts": ["127.0.0.1", "localhost", "machine-name.tailnet-name.ts.net"]
+   }
+   ```
+
+3. Tailscale Serve publishes the port over HTTPS: `sudo tailscale serve --bg 8787`. Confirm with `tailscale serve status`. Do not enable Funnel.
+4. **Recipients need network access to the release service.** Each recipient must be on the same tailnet with a device that Tailscale's access controls allow to reach this machine on port 443. Without that access, `pastry open` reports that the server cannot be reached, and it does not fall back to offline decryption.
+5. Recipients install the viewer (section H), then run `pastry open FILE.pastry`. They confirm the host shown on screen, which must be your `public_url` host.
+
+**Operational notes**
+
+- `config/release.key` is created the first time a timed package is made. Keep it out of backups (the backup command already excludes it) and keep its permissions at 0600.
+- Restoring a backup to another machine leaves timed packages unreleasable unless `release.key` is also restored. This is deliberate.
+- To revoke everything quickly, stop the service (`sudo systemctl stop pastry`), or revoke packages individually on the Packages page.
+- Expired release material is erased at startup and whenever packages are listed.
+- Upgrading from v2 needs `.venv/bin/pastry migrate` before the new server starts. The migration is additive and makes a backup first.
+
+**Not tested here:** the Tailscale steps above were not run, because no tailnet exists on the development machine.
+
+---
+
+## J. Upgrading to 1.2 (accounts and sharing)
+
+1. **Back up first, and keep a copy off the machine.**
+
+   ```bash
+   cd ~/Documents/pastry-password-server/Pastry
+   .venv/bin/pastry backup
+   .venv/bin/pastry backup verify backups/$(ls -t backups | head -1) --password-check
+   ```
+
+   `pastry backup verify` reports **Authenticity: verified** when the archive carries a MAC that this server's `config/release.key` confirms. Checksums alone only detect corruption.
+
+2. **Stop the service, update, reinstall.**
+
+   ```bash
+   sudo systemctl stop pastry
+   # update the code (git pull, or copy the new project over the old one; keep data/, config/ and backups/)
+   ./install.sh
+   ```
+
+3. **Migrate.** Either sign in as the owner (the first sign-in takes a verified backup, then migrates), or run:
+
+   ```bash
+   .venv/bin/pastry migrate
+   ```
+
+   The schema migration is one transaction and is verified before commit. A failure rolls back and leaves the database unchanged.
+
+4. **Start and check.**
+
+   ```bash
+   sudo systemctl start pastry
+   .venv/bin/pastry admin list-users
+   ```
+
+   Each account's older entries are converted to per-entry keys the next time that account signs in. The conversion is atomic per account, and a failure leaves the entries readable in the old format.
+
+**Rollback:** `sudo systemctl stop pastry`, then `.venv/bin/pastry restore backups/<archive> --require-authentic`, then reinstall the previous version.
+
+### Files that matter
+
+| File | Needed for | In backups? |
+|---|---|---|
+| `config/auth.json` | the owner's account and vault key | yes |
+| `data/pastry.db` | every account, entry, share and package record | yes |
+| `config/release.key` | timed-package release keys and sharing key binding, and backup authenticity | **no, on purpose** |
+| each person's master password | their vault | never stored |
+| each protected entry's separate password | that entry's content | never stored |
+
+**Back up `config/release.key` separately** (for example on an encrypted drive that is not next to the backups). Without it, after a restore on another machine:
+
+- timed packages cannot be released;
+- sharing fails closed until the owner runs `pastry admin rebind-keys` after comparing key fingerprints with each account's share dialog.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request with read-only permissions: lint, the full test suite on Python 3.10, 3.12 and 3.13 (with the migration, package-format and CLI suites called out), `pip-audit` on the pinned runtime dependencies, a check that no sensitive file names are tracked, and `scripts/verify-wheel.sh`, which builds the wheel and installs it into a clean environment with only the base dependencies. No secrets, databases or packages are used or uploaded.
+
+### Accounts and Tailscale
+
+All accounts use the same Tailscale address. Each account signs in with its own username and master password. Invitation links use the same address (`public_url` if set), and the server's `allowed_hosts` must include it.

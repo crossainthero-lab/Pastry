@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 import getpass
 import os
 import sqlite3
@@ -11,12 +12,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from . import __version__
 from . import auth as authmod
 from . import crypto
 from .backup import BackupError, create_backup, restore_backup, verify_backup
 from .config import Settings, load_settings
 from .db import SchemaError, Store
-from .migrate import MigrationError, migrate_v1_to_v2
+from .db import SCHEMA_VERSION
+from .migrate import MigrationError, migrate_v1_to_v2, migrate_v2_to_v3, migrate_v3_to_v4, migrate_v4_to_v5
 
 
 @dataclass
@@ -77,14 +80,25 @@ def cmd_setup(_args: argparse.Namespace, ctx: Context) -> int:
 
 
 def cmd_start(args: argparse.Namespace, ctx: Context) -> int:
-    import uvicorn
+    try:
+        import uvicorn
 
-    from .web import create_app
+        from .web import create_app
+    except ImportError as exc:
+        raise CliError("The server needs its extra packages: pip install '.[server]'") from exc
 
     settings = ctx.settings
     if not settings.auth_path.exists():
         raise CliError("Pastry is not set up yet. Run: pastry setup")
-    Store(settings.db_path).require_current()
+    store = Store(settings.db_path)
+    store.require_current()
+    import time as _time
+
+    from .release import sweep_expired
+
+    erased = sweep_expired(store, _time.time())  # erase release keys of packages already past their deadline
+    if erased:
+        print(f"Erased release material for {erased} expired package(s).")
     host = args.host or settings.host
     port = args.port or settings.port
     if host not in ("127.0.0.1", "localhost", "::1"):
@@ -177,6 +191,7 @@ def cmd_backup_verify(args: argparse.Namespace, ctx: Context) -> int:
     print(f"Archive          : {report.archive}")
     print(f"Format version   : {report.format_version}")
     print(f"Checksums        : {report.checksums}")
+    print(f"Authenticity     : {report.authenticity}")
     print(f"Integrity        : {report.integrity}")
     print(f"Schema version   : {report.schema_version}")
     print(f"Entries          : {report.entry_count}")
@@ -196,44 +211,159 @@ def cmd_migrate(_args: argparse.Namespace, ctx: Context) -> int:
     if not store.exists():
         raise CliError("No vault database found. Run: pastry setup")
     version = store.schema_version()
-    if version == 2:
-        print("The vault is already on schema v2. Nothing to do.")
+    if version == SCHEMA_VERSION:
+        print(f"The vault is already on schema v{SCHEMA_VERSION}. Nothing to do.")
         return 0
-    if version != 1:
+    if version not in (1, 2, 3, 4):
         raise CliError(f"Unknown schema version {version}; refusing to migrate.")
-    print("Migrating schema v1 -> v2. Stop the server first (systemctl stop pastry).")
-    password = ctx.prompt_password("Master password: ")
-    auth = authmod.read_auth(settings.auth_path)
-    dek = authmod.try_unlock(auth, password)
-    if dek is None:
-        raise CliError("Incorrect master password. Nothing was changed.")
+    # Every step that rewrites data is preceded by a verified backup.
+    print(f"Migrating schema v{version} -> v{SCHEMA_VERSION}. Stop the server first (systemctl stop pastry).")
+    dek = None
+    if version == 1:
+        password = ctx.prompt_password("Master password: ")
+        auth = authmod.read_auth(settings.auth_path)
+        dek = authmod.try_unlock(auth, password)
+        if dek is None:
+            raise CliError("Incorrect master password. Nothing was changed.")
     try:
         backup = create_backup(settings, settings.backup_dir)
         print(f"Pre-migration backup written: {backup}")
-        count = migrate_v1_to_v2(store, dek)
-    except (MigrationError, BackupError) as exc:
+        verify_backup(settings, backup)
+        if version == 1:
+            count = migrate_v1_to_v2(store, dek)
+            print(f"Migrated {count} entries to schema v2.")
+        if version in (1, 2):
+            migrate_v2_to_v3(store)
+        if version <= 3:
+            migrate_v3_to_v4(store)
+        info = migrate_v4_to_v5(store)
+    except (MigrationError, BackupError, sqlite3.Error) as exc:
         raise CliError(f"Migration failed and was rolled back; the database is unchanged. ({exc})") from exc
     finally:
         crypto.wipe(dek)
-    print(f"Migrated {count} entries to schema v2. Separate-password locks were preserved.")
+    print(f"Migrated to schema v{SCHEMA_VERSION}: {info['entries']} entries kept. Each account's entries are "
+          "upgraded to per-entry keys at that account's next sign-in. Separate-password locks were preserved.")
     return 0
+
+
+def cmd_open(args: argparse.Namespace, _ctx: Context) -> int:
+    from . import tui
+
+    path = Path(args.file).expanduser()
+    if not path.exists():
+        raise CliError(f"No such file: {path}")
+    if not sys.stdout.isatty():
+        raise CliError("`pastry open` needs an interactive terminal.")
+    return tui.run(None, path.resolve(), args.delete_on_expiry, args.clear_after)
+
+
+def cmd_inspect(args: argparse.Namespace, _ctx: Context) -> int:
+    from . import package
+
+    path = Path(args.file).expanduser()
+    try:
+        header = package.inspect_package(package.read_package_file(path))
+    except (package.PackageError, OSError) as exc:
+        raise CliError(str(exc)) from exc
+    print(f"Package          : {header.name}")
+    print(f"Created (UTC)    : {header.created_at}")
+    if header.is_server:
+        print("Access type      : server-enforced (needs the release server to open)")
+    else:
+        print("Access type      : offline (opens without the server)")
+    print(f"Copy allowed     : {'yes' if header.allow_copy else 'no'} (enforced by the viewer only)")
+    print(f"Expiry           : {header.expires_at or 'none'} (advisory)")
+    print(f"File size        : {path.stat().st_size} bytes")
+    print("Contents         : encrypted. Opening needs the package password.")
+    if header.is_server:
+        policy = header.policy or {}
+        print(f"Enforcement      : server-enforced ({policy.get('type')})")
+        print(f"Release server   : {header.release_url}")
+        print("                   Opening contacts that server. It is never contacted by `inspect`.")
+    return 0
+
+
+def _accounts_store(ctx: Context) -> Store:
+    store = Store(ctx.settings.db_path)
+    if not store.exists():
+        raise CliError("No vault database found. Run: pastry setup")
+    if store.schema_version() != SCHEMA_VERSION:
+        raise CliError(f"The vault database must be on schema v{SCHEMA_VERSION}. Run: pastry migrate")
+    return store
 
 
 def cmd_list_users(_args: argparse.Namespace, ctx: Context) -> int:
+    from . import accounts
+
+    store = _accounts_store(ctx)
     auth = authmod.read_auth(ctx.settings.auth_path)
-    print("Accounts:")
-    print(f"  {auth.username}  (owner)")
-    print("Multi-user accounts are disabled in this version. See SECURITY-REVIEW.md.")
+    print(f"{'ID':>4}  {'USERNAME':<24} {'ROLE':<8} STATUS")
+    for account in accounts.list_accounts(store, auth.username):
+        status = "disabled" if account["disabled"] else "active"
+        print(f"{account['id']:>4}  {account['username']:<24} {account['role']:<8} {status}")
+    pending = accounts.pending_invitations(store, time.time())
+    if pending:
+        print(f"\nPending invitations: {len(pending)} (each works once and expires)")
     return 0
 
 
-def cmd_multi_user_disabled(_args: argparse.Namespace, _ctx: Context) -> int:
-    print(
-        "error: multi-user accounts are not available in Pastry 1.1. The per-user key design is "
-        "documented in SECURITY-REVIEW.md but not implemented, so no account is created or disabled.",
-        file=sys.stderr,
-    )
-    return 2
+def cmd_rebind_keys(_args: argparse.Namespace, ctx: Context) -> int:
+    """Re-bind every account's sharing public key to this machine's server secret.
+
+    Needed after restoring a backup onto a machine whose config/release.key differs. Sharing fails
+    closed until then. Compare the fingerprints with what each account shows in its share dialog."""
+    from . import account_keys, release, sharing_crypto
+
+    store = _accounts_store(ctx)
+    kek = release.load_or_create_kek(ctx.settings.release_key_path)
+    with store.connect() as conn:
+        rows = conn.execute("SELECT account_id, public_key FROM account_keys ORDER BY account_id").fetchall()
+    if not rows:
+        print("No sharing keys exist yet. Nothing to re-bind.")
+        return 0
+    print("Sharing keys that will be re-bound to this server's secret:")
+    for row in rows:
+        print(f"  account {row['account_id']:>3}  {sharing_crypto.fingerprint(bytes(row['public_key']))}")
+    answer = ctx.prompt_text("Type REBIND to confirm the fingerprints are the ones you expect: ").strip()
+    if answer != "REBIND":
+        print("Cancelled.")
+        return 1
+    done = account_keys.rebind_all(store, sharing_crypto.binding_key(kek))
+    print(f"Re-bound {len(done)} key(s).")
+    return 0
+
+
+def cmd_create_user(_args: argparse.Namespace, ctx: Context) -> int:
+    from . import accounts
+
+    store = _accounts_store(ctx)
+    auth = authmod.read_auth(ctx.settings.auth_path)
+    username = ctx.prompt_text("Username for the new account: ").strip()
+    try:
+        token = accounts.create_invitation(store, username, "user", auth.username, auth.username, time.time())
+    except (accounts.AccountError, authmod.AuthError) as exc:
+        raise CliError(str(exc)) from exc
+    base = ctx.settings.public_url.rstrip("/") if ctx.settings.public_url else "<your Pastry address>"
+    print(f"Invitation for '{username}' created. Send this link through a channel you trust:")
+    print(f"  {base}/invite/{token}")
+    print(f"It works once and expires in {accounts.INVITE_TTL_SECONDS // 3600} hours. The invitee chooses their own")
+    print("master password. The owner never sees it, and no default password exists.")
+    return 0
+
+
+def cmd_disable_user(args: argparse.Namespace, ctx: Context) -> int:
+    from . import accounts
+
+    store = _accounts_store(ctx)
+    auth = authmod.read_auth(ctx.settings.auth_path)
+    if args.username.strip().lower() == auth.username.lower():
+        raise CliError("The owner account cannot be disabled.")
+    account_id = accounts.find_id(store, args.username.strip())
+    if account_id is None:
+        raise CliError(f"No account named '{args.username}'.")
+    accounts.disable(store, account_id, time.time())
+    print(f"Disabled '{args.username}'. Its sessions can no longer be used, and its data is kept encrypted.")
+    return 0
 
 
 def cmd_restore(args: argparse.Namespace, ctx: Context) -> int:
@@ -244,8 +374,10 @@ def cmd_restore(args: argparse.Namespace, ctx: Context) -> int:
         if answer != "RESTORE":
             print("Restore cancelled.")
             return 1
-    result = restore_backup(ctx.settings, archive)
-    print(f"Restored {result['entries']} entries from {archive.name}.")
+    result = restore_backup(ctx.settings, archive, require_authentic=args.require_authentic)
+    print(f"Restored {result['entries']} entries from {archive.name}. Authenticity: {result['authenticity']}.")
+    if result["authenticity"] != "verified":
+        print("Note: checksums only detect corruption. They do not prove who produced the archive.")
     print("Previous files were kept as *.before-restore-<timestamp>.")
     return 0
 
@@ -255,9 +387,22 @@ def cmd_restore(args: argparse.Namespace, ctx: Context) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pastry", description="Pastry Password Server")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version", action="version", version=f"pastry {__version__}")
+    sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("setup", help="first-run setup: create the admin account").set_defaults(func=cmd_setup)
+
+    opener = sub.add_parser("open", help="open a .pastry package in the terminal viewer")
+    opener.add_argument("file", help="path to a .pastry file")
+    opener.add_argument("--clear-after", type=float, default=30.0,
+                        help="seconds before a copied value is cleared, if unchanged (default 30; 0 disables)")
+    opener.add_argument("--delete-on-expiry", action="store_true",
+                        help="delete this exact file when the package expires")
+    opener.set_defaults(func=cmd_open)
+
+    inspector = sub.add_parser("inspect", help="show non-secret package metadata")
+    inspector.add_argument("file", help="path to a .pastry file")
+    inspector.set_defaults(func=cmd_inspect)
 
     start = sub.add_parser("start", help="run the server in the foreground")
     start.add_argument("--host", help="bind address (default 127.0.0.1)")
@@ -272,9 +417,13 @@ def build_parser() -> argparse.ArgumentParser:
     username.add_argument("--username", help="new username (prompted if omitted)")
     username.set_defaults(func=cmd_set_username)
     admin.add_parser("status", help="show configuration without secrets").set_defaults(func=cmd_status)
-    admin.add_parser("list-users", help="list accounts").set_defaults(func=cmd_list_users)
-    admin.add_parser("create-user", help="(not available in 1.1)").set_defaults(func=cmd_multi_user_disabled)
-    admin.add_parser("disable-user", help="(not available in 1.1)").set_defaults(func=cmd_multi_user_disabled)
+    admin.add_parser("list-users", help="list accounts and their status").set_defaults(func=cmd_list_users)
+    admin.add_parser("create-user", help="create an invitation for a new account").set_defaults(func=cmd_create_user)
+    admin.add_parser("rebind-keys", help="re-bind sharing keys after restoring onto a new machine").set_defaults(
+        func=cmd_rebind_keys)
+    disable = admin.add_parser("disable-user", help="disable an account and end its sessions")
+    disable.add_argument("username")
+    disable.set_defaults(func=cmd_disable_user)
 
     sub.add_parser("migrate", help="upgrade the vault database from schema v1 to v2").set_defaults(func=cmd_migrate)
 
@@ -288,6 +437,8 @@ def build_parser() -> argparse.ArgumentParser:
     restore = sub.add_parser("restore", help="restore from a backup archive")
     restore.add_argument("archive", help="path to a pastry-backup-*.tar.gz file")
     restore.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    restore.add_argument("--require-authentic", action="store_true",
+                         help="refuse archives whose HMAC cannot be verified with this server's key")
     restore.set_defaults(func=cmd_restore)
     return parser
 
@@ -295,6 +446,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None, context: Context | None = None) -> int:
     os.umask(0o077)  # new files and directories are private by default
     args = build_parser().parse_args(argv)
+    if args.command is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            from . import tui
+
+            return tui.run(None, None, False, 30.0)  # package picker in the current directory
+        build_parser().print_help()
+        return 0
     ctx = context or Context(settings=load_settings())
     try:
         return args.func(args, ctx)

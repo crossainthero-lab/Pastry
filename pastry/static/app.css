@@ -257,7 +257,7 @@ input[type="range"] { padding: 0; }
 
 .entry-row {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: auto 1fr;
   gap: 12px;
   align-items: center;
   padding: 14px 6px;
@@ -505,3 +505,36 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
   .input-with-action { flex-wrap: wrap; }
   .input-with-action .btn { width: 100%; }
 }
+
+/* ----- v1.2: export selection ----- */
+.entry-row > input[type="checkbox"] { width: auto; margin-left: 6px; }
+.entry-main {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  align-items: center;
+  padding: 14px 6px;
+  text-decoration: none;
+  min-width: 0;
+  color: inherit;
+}
+.entry-main:hover { background: var(--hover); }
+.export-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.choice { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; margin: 0 0 14px; }
+.choice legend { font-size: 0.85rem; color: var(--muted); padding: 0 4px; }
+.choice label { display: flex; gap: 8px; align-items: center; margin: 6px 0; }
+.export-body { max-height: 88vh; overflow-y: auto; }
+
+/* ----- v1.2: packages and access options ----- */
+.indent { margin: -6px 0 10px 28px; }
+.indent select, .indent input { max-width: 260px; }
+.kv.pkg { grid-template-columns: minmax(160px, 1.4fr) minmax(120px, 1fr) auto; }
+.actions.wrap { flex-wrap: wrap; justify-content: flex-end; }
+
+/* ----- v1.2: accounts ----- */
+.invite-box { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; margin-top: 14px; }
+.invite-link { word-break: break-all; font-size: 0.85rem; }
+
+/* ----- v1.2: sharing ----- */
+.shared-row { grid-template-columns: 1fr; }
+dialog .kv.pkg { grid-template-columns: minmax(120px, 1fr) minmax(100px, 1fr) auto; }
