@@ -437,7 +437,8 @@ def create_app(
             session = current_session(request)
         except NotAuthenticated:
             return RedirectResponse("/login", status_code=303)
-        return templates.TemplateResponse(request, "app.html", {"csrf": session.csrf, "username": session.username})
+        return templates.TemplateResponse(request, "app.html", {"csrf": session.csrf, "username": session.username,
+                                                                "role": session.role})
 
     def _login_page(request: Request, status: int, error: str = "", notice: str = "", username: str = ""):
         return templates.TemplateResponse(

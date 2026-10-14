@@ -213,6 +213,8 @@
     if (head === "favourites") document.querySelector('[data-nav="favourites"]').setAttribute("aria-current", "page");
     if (head === "settings") document.querySelector('[data-nav="settings"]').setAttribute("aria-current", "page");
     if (head === "packages") document.querySelector('[data-nav="packages"]').setAttribute("aria-current", "page");
+    if (head === "users") document.querySelector('[data-nav="users"]').setAttribute("aria-current", "page");
+    if (head === "shared") document.querySelector('[data-nav="shared"]').setAttribute("aria-current", "page");
     if (head === "category") {
       document.querySelectorAll("#category-list a").forEach((link) => {
         if (link.dataset.category === arg) link.setAttribute("aria-current", "page");
@@ -238,7 +240,7 @@
     }
     state.openEntryId = nextEntry;
     highlightNav(head, arg);
-    toolbar.hidden = head === "settings" || head === "packages";
+    toolbar.hidden = ["settings", "packages", "users", "shared"].includes(head);
     setNavOpen(false);
 
     try {
@@ -271,6 +273,14 @@
         state.listSpec = null;
         await refreshCategories();
         await showPackages();
+      } else if (head === "users") {
+        state.listSpec = null;
+        await refreshCategories();
+        await showUsers();
+      } else if (head === "shared") {
+        state.listSpec = null;
+        await refreshCategories();
+        showShared();
       } else {
         location.hash = "#/";
       }
@@ -803,6 +813,99 @@
     } catch (err) {
       toast(err.message);
     }
+  }
+
+  // ----- Users (owner only) and Shared With Me ----------------------------------
+
+  function formatShort(iso) {
+    return iso ? formatDate(iso) : "";
+  }
+
+  async function showUsers() {
+    const data = await api.get("/api/users");
+    const rows = data.accounts.map((a) => {
+      const actions = [];
+      if (a.role !== "owner") {
+        actions.push(h("button", {
+          class: "btn small danger",
+          type: "button",
+          disabled: a.disabled,
+          text: a.disabled ? "Disabled" : "Disable",
+          onclick: () => disableAccount(a),
+        }));
+      }
+      return h(
+        "div",
+        { class: "kv pkg" },
+        h("div", { class: "k" }, h("div", { text: a.username })),
+        h("div", { class: "v plain" }, h("div", { text: a.role === "owner" ? "Owner" : "Member" }),
+          h("div", { class: "small muted", text: a.created_at ? `Created ${formatShort(a.created_at)}` : "Owner account" })),
+        h("div", { class: "actions wrap" }, h("span", { class: "badge", text: a.disabled ? "disabled" : "active" }), actions),
+      );
+    });
+    const usernameInput = h("input", { type: "text", maxlength: "64", autocomplete: "off", "aria-label": "Username for the new account" });
+    const linkBox = h("div", { hidden: true, class: "invite-box" });
+    const form = h(
+      "form",
+      {
+        class: "inline-form",
+        onsubmit: async (event) => {
+          event.preventDefault();
+          try {
+            const result = await api.post("/api/users/invitations", { username: usernameInput.value.trim() });
+            const link = `${location.origin}${result.path}`;
+            linkBox.replaceChildren(
+              h("p", { text: `Invitation for ${result.username}. It works once and expires in ${result.expires_in_hours} hours. The new user chooses their own master password.` }),
+              h("p", { class: "mono invite-link", text: link }),
+              h("button", { class: "btn small", type: "button", text: "Copy link", onclick: () => copyText(link, "Invitation link copied") }),
+            );
+            linkBox.hidden = false;
+            usernameInput.value = "";
+          } catch (err) {
+            toast(err.message);
+          }
+        },
+      },
+      h("label", { class: "field" }, h("span", { text: "Create an invitation for a new account" }), usernameInput),
+      h("button", { class: "btn", type: "submit", text: "Create invitation" }),
+    );
+    const pending = data.invitations.length
+      ? h("p", { class: "help", text: `Pending invitations: ${data.invitations.length}. Each works once.` })
+      : null;
+    view.replaceChildren(
+      h("div", { class: "view-head" }, h("h1", { text: "Users" }), h("span", { class: "muted small", text: `${data.accounts.length} ${data.accounts.length === 1 ? "account" : "accounts"}` })),
+      h("p", { class: "help", text: "Each account has its own password and its own encrypted vault. You can manage accounts, but you cannot read another account's entries." }),
+      h("div", { class: "panel" }, h("div", { class: "panel-body" }, rows)),
+      h("section", { class: "editor-section" }, h("h2", { text: "Invite someone" }), form, linkBox, pending),
+    );
+  }
+
+  async function disableAccount(account) {
+    const ok = await dialog({
+      title: `Disable ${account.username}?`,
+      message: "They are signed out everywhere and cannot sign in. Their data stays encrypted on the server and is not deleted.",
+      confirmLabel: "Disable",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await api.post(`/api/users/${account.id}/disable`);
+      toast("Account disabled");
+      showUsers();
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  function showShared() {
+    view.replaceChildren(
+      h("div", { class: "view-head" }, h("h1", { text: "Shared With Me" })),
+      h("div", { class: "empty" },
+        h("h2", { text: "Entry sharing is not available yet" }),
+        h("p", { text: "Sharing one entry with another account needs recipient key verification and per-entry keys. Both are still in design, so sharing is switched off. Entries you create stay private to your account." }),
+        h("p", { class: "small muted", text: "See docs/MULTIUSER-CRYPTO.md in the project for the reasons." }),
+      ),
+    );
   }
 
   // ----- editor -----------------------------------------------------------
@@ -1395,6 +1498,9 @@
 
   function boot() {
     applyTheme(savedTheme());
+    if (document.body.dataset.role !== "owner") {
+      document.querySelectorAll("[data-owner-only]").forEach((link) => { link.hidden = true; });
+    }
     document.getElementById("menu-btn").addEventListener("click", () => {
       setNavOpen(!shell.classList.contains("nav-open"));
     });

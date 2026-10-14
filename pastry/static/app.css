@@ -530,3 +530,7 @@ dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
 .indent select, .indent input { max-width: 260px; }
 .kv.pkg { grid-template-columns: minmax(160px, 1.4fr) minmax(120px, 1fr) auto; }
 .actions.wrap { flex-wrap: wrap; justify-content: flex-end; }
+
+/* ----- v1.2: accounts ----- */
+.invite-box { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; margin-top: 14px; }
+.invite-link { word-break: break-all; font-size: 0.85rem; }
