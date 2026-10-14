@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from . import __version__
 from . import auth as authmod
 from . import crypto
 from .backup import BackupError, create_backup, restore_backup, verify_backup
@@ -77,9 +78,12 @@ def cmd_setup(_args: argparse.Namespace, ctx: Context) -> int:
 
 
 def cmd_start(args: argparse.Namespace, ctx: Context) -> int:
-    import uvicorn
+    try:
+        import uvicorn
 
-    from .web import create_app
+        from .web import create_app
+    except ImportError as exc:
+        raise CliError("The server needs its extra packages: pip install '.[server]'") from exc
 
     settings = ctx.settings
     if not settings.auth_path.exists():
@@ -219,6 +223,35 @@ def cmd_migrate(_args: argparse.Namespace, ctx: Context) -> int:
     return 0
 
 
+def cmd_open(args: argparse.Namespace, _ctx: Context) -> int:
+    from . import tui
+
+    path = Path(args.file).expanduser()
+    if not path.exists():
+        raise CliError(f"No such file: {path}")
+    if not sys.stdout.isatty():
+        raise CliError("`pastry open` needs an interactive terminal.")
+    return tui.run(None, path.resolve(), args.delete_on_expiry, args.clear_after)
+
+
+def cmd_inspect(args: argparse.Namespace, _ctx: Context) -> int:
+    from . import package
+
+    path = Path(args.file).expanduser()
+    try:
+        header = package.inspect_package(package.read_package_file(path))
+    except (package.PackageError, OSError) as exc:
+        raise CliError(str(exc)) from exc
+    print(f"Package          : {header.name}")
+    print(f"Created (UTC)    : {header.created_at}")
+    print(f"Access type      : {header.access} (opens without the server)")
+    print(f"Copy allowed     : {'yes' if header.allow_copy else 'no'} (enforced by the viewer only)")
+    print(f"Expiry           : {header.expires_at or 'none'} (advisory)")
+    print(f"File size        : {path.stat().st_size} bytes")
+    print("Contents         : encrypted. Opening needs the package password.")
+    return 0
+
+
 def cmd_list_users(_args: argparse.Namespace, ctx: Context) -> int:
     auth = authmod.read_auth(ctx.settings.auth_path)
     print("Accounts:")
@@ -255,9 +288,22 @@ def cmd_restore(args: argparse.Namespace, ctx: Context) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pastry", description="Pastry Password Server")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version", action="version", version=f"pastry {__version__}")
+    sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("setup", help="first-run setup: create the admin account").set_defaults(func=cmd_setup)
+
+    opener = sub.add_parser("open", help="open a .pastry package in the terminal viewer")
+    opener.add_argument("file", help="path to a .pastry file")
+    opener.add_argument("--clear-after", type=float, default=30.0,
+                        help="seconds before a copied value is cleared, if unchanged (default 30; 0 disables)")
+    opener.add_argument("--delete-on-expiry", action="store_true",
+                        help="delete this exact file when the package expires")
+    opener.set_defaults(func=cmd_open)
+
+    inspector = sub.add_parser("inspect", help="show non-secret package metadata")
+    inspector.add_argument("file", help="path to a .pastry file")
+    inspector.set_defaults(func=cmd_inspect)
 
     start = sub.add_parser("start", help="run the server in the foreground")
     start.add_argument("--host", help="bind address (default 127.0.0.1)")
@@ -295,6 +341,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None, context: Context | None = None) -> int:
     os.umask(0o077)  # new files and directories are private by default
     args = build_parser().parse_args(argv)
+    if args.command is None:
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            from . import tui
+
+            return tui.run(None, None, False, 30.0)  # package picker in the current directory
+        build_parser().print_help()
+        return 0
     ctx = context or Context(settings=load_settings())
     try:
         return args.func(args, ctx)
