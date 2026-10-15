@@ -14,6 +14,7 @@ from .crypto import KdfParams
 DEFAULT_HOME = Path(__file__).resolve().parent.parent
 
 ALLOWED_OVERRIDES = {
+    "lan",
     "host",
     "port",
     "session_timeout_minutes",
@@ -32,6 +33,8 @@ ALLOWED_OVERRIDES = {
 @dataclass
 class Settings:
     home: Path = DEFAULT_HOME
+    # LAN mode: HTTPS (self-signed) on all interfaces, port 8443. Same as `pastry start --lan`.
+    lan: bool = False
     host: str = "127.0.0.1"
     port: int = 8787
     session_timeout_minutes: int = 10

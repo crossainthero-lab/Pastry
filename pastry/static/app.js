@@ -476,6 +476,7 @@
     const locked = entry.locked && !entry.unlocked;
     const actions = [];
     if (!locked) actions.push(h("a", { class: "btn", href: `#/entry/${id}/edit`, text: "Edit" }));
+    if (!locked) actions.push(h("button", { class: "btn", type: "button", text: "Export as .pastry", onclick: () => exportEntry(entry) }));
     actions.push(h("button", { class: "btn danger", type: "button", text: "Delete", onclick: () => deleteEntry(entry) }));
     if (entry.locked && entry.unlocked) {
       actions.push(
@@ -542,6 +543,44 @@
       await api.post(`/api/entries/${id}/protect/remove`);
       toast("Separate password removed");
       await showDetail(id);
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  async function exportEntry(entry) {
+    const first = await dialog({
+      title: `Export "${entry.name}" as .pastry`,
+      message: `Choose a password for the file. It is needed to open the file with the pastry command-line tool, and it cannot be recovered. Use at least ${MIN_SECRET_LENGTH} characters.`,
+      confirmLabel: "Next",
+      input: { label: "File password" },
+    });
+    if (first === null) return;
+    if (first.length < MIN_SECRET_LENGTH) return toast(`Use at least ${MIN_SECRET_LENGTH} characters`);
+    const second = await dialog({
+      title: "Repeat the file password",
+      confirmLabel: "Download",
+      input: { label: "File password again" },
+    });
+    if (second === null) return;
+    if (second !== first) return toast("The passwords did not match");
+    try {
+      const res = await fetchRaw("POST", `/api/entries/${entry.id}/export`, { passphrase: first });
+      if (res.status === 401) return redirectToLogin();
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new ApiError(res.status, (detail && detail.detail) || "Export failed.");
+      }
+      const disposition = res.headers.get("Content-Disposition") || "";
+      const match = /filename="([^"]+)"/.exec(disposition);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const link = h("a", { href: url, download: match ? match[1] : "entry.pastry" });
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      toast("Entry exported as .pastry");
     } catch (err) {
       toast(err.message);
     }
@@ -1038,7 +1077,7 @@
         if (!res.ok) throw new ApiError(res.status, "Export failed.");
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
-        const link = h("a", { href: url, download: "pastry-export.json" });
+        const link = h("a", { href: url, download: "pastry-export.pastry" });
         document.body.append(link);
         link.click();
         link.remove();
@@ -1050,7 +1089,7 @@
       }
     });
 
-    const importFile = h("input", { type: "file", accept: "application/json,.json", "aria-label": "Export file" });
+    const importFile = h("input", { type: "file", accept: ".pastry,application/json,.json", "aria-label": "Export file" });
     const importPass = h("input", { type: "password", autocomplete: "off", maxlength: "256", "aria-label": "Import passphrase" });
     const importButton = h("button", { class: "btn", type: "button", text: "Import" });
     importButton.addEventListener("click", async () => {

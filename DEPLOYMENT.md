@@ -227,3 +227,18 @@ If the unit is already installed from v1.0, rerun `./install.sh --systemd`, whic
 | `allowed_origins` | `[]` | Usually empty |
 
 Unknown keys are rejected at startup.
+
+## H. LAN mode (HTTPS for every device on the local network)
+
+The quickest way to use Pastry from other computers on the same network, with no proxy:
+
+```bash
+.venv/bin/pastry start --lan          # HTTPS on 0.0.0.0:8443, self-signed certificate
+```
+
+- Open `https://<server-ip>:8443` from any device on the LAN. Accept the certificate warning once per device.
+- The certificate (`data/tls/`, key mode 0600) is generated on first run and regenerated if the host's addresses change. Its names and addresses are added to `allowed_hosts` automatically.
+- Run it at boot with `./install.sh --lan-systemd`, then `sudo systemctl enable --now pastry`.
+- Or set `"lan": true` in `config/pastry.json`.
+- Do not forward port 8443 from your router. For access outside the LAN use Tailscale (section C).
+- A self-signed certificate does not protect against an attacker already on your LAN who can intercept the first connection. Compare the fingerprint, or use Caddy with a CA you trust (section D).

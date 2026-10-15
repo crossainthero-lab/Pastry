@@ -25,7 +25,7 @@ import sqlite3
 from datetime import datetime, timezone
 from typing import Any
 
-from . import crypto
+from . import crypto, entryfile
 from .crypto import CryptoError, KdfParams
 from .db import Store
 
@@ -320,6 +320,27 @@ class Vault:
         self._set_lock(entry_id, expect_locked=True, new_meta_lock=lock, content_blob=blob)
 
     # ----- encrypted export / import -------------------------------------
+
+    def export_entry(self, entry_id: int, keys: dict[int, bytearray], passphrase: str) -> tuple[str, dict]:
+        """One entry as a `.pastry` document under its own password. A protected entry
+        must be unlocked in the caller's session first. Returns (name, document)."""
+        with self.store.connect() as conn:
+            row = self._fetch(conn, entry_id)
+        meta = self._meta(row)
+        content = self._content(row, meta, keys.get(entry_id))
+        try:
+            document = entryfile.seal_entry(
+                {
+                    "name": meta["name"], "url": meta["url"], "category": meta["category"],
+                    "favourite": meta["favourite"], "created_at": meta["created_at"],
+                    "updated_at": meta["updated_at"], **content,
+                },
+                passphrase,
+                self.kdf,
+            )
+        except entryfile.EntryFileError as exc:
+            raise VaultError("invalid", exc.message) from exc
+        return meta["name"], document
 
     def export(self, passphrase: str) -> dict:
         """Encrypted document. Protected entries stay sealed under their own passwords."""

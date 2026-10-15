@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import auth as authmod
+from . import entryfile
 from . import crypto
 from .auth import AuthFile
 from .config import Settings
@@ -580,12 +581,22 @@ def create_app(
         session.drop_key(entry_id)
         return Response(status_code=204)
 
+    # ----- single-entry export (.pastry) -----
+
+    @app.post("/api/entries/{entry_id}/export")
+    def export_entry(entry_id: int, body: PassphraseIn, session: Session = Depends(require_write)):
+        name, document = ctx.vault(session).export_entry(
+            entry_id, entry_keys(session, entry_id, touch=True), body.passphrase
+        )
+        filename = entryfile.suggested_filename(name)
+        return JSONResponse(document, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
     # ----- backup export / import -----
 
     @app.post("/api/export")
     def export_vault(body: PassphraseIn, session: Session = Depends(require_write)):
         document = ctx.vault(session).export(body.passphrase)
-        filename = f"pastry-export-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.json"
+        filename = f"pastry-export-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.pastry"
         return JSONResponse(document, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
     @app.post("/api/import")

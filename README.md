@@ -80,6 +80,7 @@ If you prefer manual installation, the steps are: `python3 -m venv .venv`, `.ven
 |---|---|
 | Start (foreground) | `.venv/bin/pastry start` |
 | Start on another port | `.venv/bin/pastry start --port 9000` |
+| Start for the whole LAN (HTTPS, port 8443) | `.venv/bin/pastry start --lan` |
 | Stop a foreground server | `Ctrl+C` in its terminal |
 | Start as a service | `sudo systemctl start pastry` |
 | Stop the service | `sudo systemctl stop pastry` |
@@ -458,3 +459,23 @@ Please read these before relying on Pastry for anything important.
 ## Licence and use
 
 Personal project. Use it at your own risk, and keep a tested backup before you move any real credentials into it.
+
+
+---
+
+## Exporting a single entry as .pastry
+
+Every unlocked entry has an **Export as .pastry** button. It asks for a password (at least 12 characters, typed twice) and downloads one encrypted file containing only that entry. The file does not contain the vault key or any other entry, and the password cannot be recovered.
+
+Open it with the terminal UI, which does not need the server:
+
+```bash
+pastry                      # in any folder: browse to a .pastry file
+pastry open path/to/file.pastry
+```
+
+Choose the file, enter its password, and the entry is shown (secrets are hidden until you press `r`). Press `e` to export it again as a new `.pastry` file under a new password. Keys: `Up/Down` move or scroll, `p` type a path, `b` back, `q` quit.
+
+If `pastry` is not found, use `.venv/bin/pastry`, or link it: `sudo ln -s "$PWD/.venv/bin/pastry" /usr/local/bin/pastry`.
+
+A standalone copy of just this terminal UI, for machines that don't run the server, is published at https://github.com/crossainthero-lab/pastrypws-cli.

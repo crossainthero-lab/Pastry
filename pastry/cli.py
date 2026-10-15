@@ -16,6 +16,7 @@ from . import crypto
 from .backup import BackupError, create_backup, restore_backup, verify_backup
 from .config import Settings, load_settings
 from .db import SchemaError, Store
+from .lan import LAN_DEFAULT_PORT
 from .migrate import MigrationError, migrate_v1_to_v2
 
 
@@ -85,20 +86,38 @@ def cmd_start(args: argparse.Namespace, ctx: Context) -> int:
     if not settings.auth_path.exists():
         raise CliError("Pastry is not set up yet. Run: pastry setup")
     Store(settings.db_path).require_current()
-    host = args.host or settings.host
-    port = args.port or settings.port
-    if host not in ("127.0.0.1", "localhost", "::1"):
+    lan = args.lan or settings.lan
+    host = args.host or ("0.0.0.0" if lan else settings.host)
+    port = args.port or (LAN_DEFAULT_PORT if lan else settings.port)
+    ssl_kwargs: dict = {}
+    scheme = "http"
+    if lan:
+        from .lan import ensure_certificate, local_names_and_ips
+
+        names, ips = local_names_and_ips()
+        cert, key = ensure_certificate(settings.data_dir / "tls", names, ips)
+        ssl_kwargs = {"ssl_certfile": str(cert), "ssl_keyfile": str(key)}
+        scheme = "https"
+        for extra in names + ips:
+            if extra not in settings.allowed_hosts:
+                settings.allowed_hosts.append(extra)
+        print("LAN mode: HTTPS with a self-signed certificate. Open one of:")
+        for ip in ips:
+            if ip != "127.0.0.1":
+                print(f"  https://{ip}:{port}")
+        print("Your browser warns about the certificate the first time; accept it for this address.")
+    elif host not in ("127.0.0.1", "localhost", "::1"):
         print(
             f"WARNING: binding to {host} accepts network connections over plain HTTP.\n"
-            "Only do this behind HTTPS (Caddy or Tailscale). See README.md.",
+            "Only do this behind HTTPS (Caddy or Tailscale), or use --lan. See README.md.",
             file=sys.stderr,
         )
     for warning in authmod.permission_warnings(settings.auth_path):
         print(f"WARNING: {warning}", file=sys.stderr)
 
     app = create_app(settings)
-    print(f"Pastry is running on http://{host}:{port} (Ctrl+C to stop)")
-    uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False, server_header=False)
+    print(f"Pastry is running on {scheme}://{host}:{port} (Ctrl+C to stop)")
+    uvicorn.run(app, host=host, port=port, log_level="warning", access_log=False, server_header=False, **ssl_kwargs)
     return 0
 
 
@@ -254,14 +273,23 @@ def cmd_restore(args: argparse.Namespace, ctx: Context) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="pastry", description="Pastry Password Server")
-    sub = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        prog="pastry",
+        description="Pastry Password Server. Run with no command to open the terminal UI for .pastry files.",
+    )
+    sub = parser.add_subparsers(dest="command")
+    open_cmd = sub.add_parser("open", help="open a .pastry entry file in the terminal UI")
+    open_cmd.add_argument("file", nargs="?", help="a .pastry file or a folder to browse (default: current folder)")
 
     sub.add_parser("setup", help="first-run setup: create the admin account").set_defaults(func=cmd_setup)
 
     start = sub.add_parser("start", help="run the server in the foreground")
     start.add_argument("--host", help="bind address (default 127.0.0.1)")
-    start.add_argument("--port", type=int, help="port (default 8787)")
+    start.add_argument("--port", type=int, help="port (default 8787, or 8443 with --lan)")
+    start.add_argument(
+        "--lan", action="store_true",
+        help="serve HTTPS (self-signed) on all interfaces so other devices on the network can connect",
+    )
     start.set_defaults(func=cmd_start)
 
     admin = sub.add_parser("admin", help="manage the admin account").add_subparsers(dest="admin_command", required=True)
@@ -295,6 +323,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None, context: Context | None = None) -> int:
     os.umask(0o077)  # new files and directories are private by default
     args = build_parser().parse_args(argv)
+    if args.command in (None, "open"):
+        from .tui import run
+
+        try:
+            return run(getattr(args, "file", None))
+        except (KeyboardInterrupt, EOFError):
+            return 0
     ctx = context or Context(settings=load_settings())
     try:
         return args.func(args, ctx)

@@ -1,0 +1,31 @@
+# systemd unit for Pastry. Placeholders (__USER__, __GROUP__, __HOME__) are filled in
+# by ./install.sh --systemd. Edit by hand if you prefer.
+[Unit]
+Description=Pastry Password Server (LAN HTTPS :8443)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Group=__GROUP__
+WorkingDirectory=__HOME__
+Environment=PASTRY_HOME=__HOME__
+ExecStart=__HOME__/.venv/bin/pastry start --lan
+Restart=on-failure
+RestartSec=5
+
+# Hardening: Pastry only needs to read config/ and write data/ and backups/.
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+ReadWritePaths=__HOME__/data __HOME__/backups
+
+[Install]
+WantedBy=multi-user.target
